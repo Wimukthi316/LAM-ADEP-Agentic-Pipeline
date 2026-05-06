@@ -183,6 +183,13 @@ def _config_for(thread_id: str) -> dict:
 # Endpoints
 # ---------------------------------------------------------------------------
 
+_latest_status = {}
+
+@app.get("/status", tags=["Pipeline"])
+async def get_status():
+    """Return the current state of the pipeline/LangGraph."""
+    return _latest_status
+
 @app.get("/", tags=["Health"])
 async def health_check():
     """Lightweight liveness probe."""
@@ -219,6 +226,15 @@ async def start_pipeline(body: StartRequest):
     current_state = _state_to_dict(snapshot)
 
     logger.info("Pipeline paused at HITL gate — thread %s", thread_id)
+
+    global _latest_status
+    _latest_status = {
+        "status": "paused_for_approval",
+        "current_stage": "transform",
+        "thread_id": thread_id,
+        "message": "Pipeline paused. Awaiting human approval.",
+        "stages_completed": ["discovery"]
+    }
 
     return APIResponse(
         success=True,
@@ -268,15 +284,26 @@ async def approve_pipeline(body: ApproveRequest):
 
     logger.info("Pipeline finished — thread %s", body.thread_id)
 
+    msg = (
+        "Pipeline completed successfully."
+        if body.action.strip().lower() == "approve"
+        else "Pipeline completed — code was rejected by human reviewer."
+    )
+
+    global _latest_status
+    _latest_status = {
+        "status": "completed",
+        "current_stage": "orchestrator",
+        "thread_id": body.thread_id,
+        "message": msg,
+        "stages_completed": ["discovery", "transform", "healing", "orchestrator"]
+    }
+
     return APIResponse(
         success=True,
         thread_id=body.thread_id,
         state=final_state,
-        message=(
-            "Pipeline completed successfully."
-            if body.action.strip().lower() == "approve"
-            else "Pipeline completed — code was rejected by human reviewer."
-        ),
+        message=msg,
     )
 
 

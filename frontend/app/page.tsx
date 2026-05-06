@@ -209,7 +209,7 @@ export default function Dashboard() {
   const handleStart = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await axios.post(`${API_BASE}/start`);
+      const res = await axios.post(`${API_BASE}/start`, { input_data: "sample_data" });
       const data = res.data;
 
       setPipelineState({
