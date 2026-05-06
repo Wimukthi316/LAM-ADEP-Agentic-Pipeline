@@ -1,0 +1,26 @@
+# Environments & Secrets
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Python / Backend
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.venv/
+
+# Node.js / Frontend
+node_modules/
+.next/
+out/
+build/
+.npm/
+
+# OS / IDE Files
+.DS_Store
+.vscode/
+.idea/
