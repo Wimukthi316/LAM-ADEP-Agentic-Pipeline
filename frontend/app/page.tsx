@@ -1,12 +1,7 @@
 "use client";
 
 import React, { useState, useCallback, useEffect, useMemo } from "react";
-import ReactFlow, {
-  Background,
-  type Node,
-  type Edge,
-  type NodeTypes,
-} from "reactflow";
+import type { Node, Edge } from "reactflow";
 import axios from "axios";
 import {
   Play,
@@ -21,16 +16,12 @@ import {
   Brain,
   Radio,
 } from "lucide-react";
-import PipelineNode, { type NodeStatus } from "@/components/PipelineNode";
+import { type NodeStatus } from "@/components/PipelineNode";
+import PipelineFlowGraph from "@/components/PipelineFlowGraph";
 import AnalyticsChart from "@/components/AnalyticsChart";
 import ToastContainer, { useToast } from "@/components/Toast";
 
 const API_BASE = "http://localhost:8000";
-
-// ── Node types registration ──
-const nodeTypes: NodeTypes = {
-  pipeline: PipelineNode,
-};
 
 // ── Pipeline stage definitions ──
 const STAGES = ["discovery", "transform", "healing", "orchestrator"] as const;
@@ -41,6 +32,7 @@ interface PipelineState {
   thread_id: string | null;
   message: string;
   stages_completed: string[];
+  generated_code: string;
 }
 
 const DEFAULT_STATE: PipelineState = {
@@ -49,7 +41,53 @@ const DEFAULT_STATE: PipelineState = {
   thread_id: null,
   message: "Pipeline ready. Press Start to begin.",
   stages_completed: [],
+  generated_code: "",
 };
+
+/** Map backend /status values to dashboard UI status. */
+function uiStatusFromBackend(raw: unknown): PipelineState["status"] | null {
+  if (raw === "paused_for_approval") return "paused";
+  if (raw === "completed") return "completed";
+  if (raw === "running") return "running";
+  if (raw === "failed") return "failed";
+  if (raw === "idle") return "idle";
+  return null;
+}
+
+function mergePollIntoPipelineState(
+  raw: Record<string, unknown>,
+  prev: PipelineState
+): PipelineState {
+  const status = uiStatusFromBackend(raw.status) ?? prev.status;
+  return {
+    ...prev,
+    status,
+    current_stage:
+      typeof raw.current_stage === "string"
+        ? raw.current_stage
+        : prev.current_stage,
+    thread_id:
+      typeof raw.thread_id === "string" ? raw.thread_id : prev.thread_id,
+    message: typeof raw.message === "string" ? raw.message : prev.message,
+    stages_completed: Array.isArray(raw.stages_completed)
+      ? (raw.stages_completed as string[])
+      : prev.stages_completed,
+    generated_code:
+      typeof raw.generated_code === "string"
+        ? raw.generated_code
+        : prev.generated_code,
+  };
+}
+
+function apiErrorDetail(data: unknown): string {
+  if (!data || typeof data !== "object") return "Request failed.";
+  const d = data as Record<string, unknown>;
+  const detail = d.detail;
+  if (typeof detail === "string") return detail;
+  if (detail != null) return JSON.stringify(detail);
+  if (typeof d.error === "string") return d.error;
+  return "Request failed.";
+}
 
 // ── Derive node status from pipeline state ──
 function getNodeStatus(
@@ -191,11 +229,13 @@ export default function Dashboard() {
     const interval = setInterval(async () => {
       try {
         const res = await axios.get(`${API_BASE}/status`);
-        if (res.data) {
-          setPipelineState((prev) => ({
-            ...prev,
-            ...res.data,
-          }));
+        if (res.data && typeof res.data === "object") {
+          setPipelineState((prev) =>
+            mergePollIntoPipelineState(
+              res.data as Record<string, unknown>,
+              prev
+            )
+          );
         }
       } catch {
         // Silently fail — we don't want polling errors to spam the user
@@ -209,22 +249,54 @@ export default function Dashboard() {
   const handleStart = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await axios.post(`${API_BASE}/start`, { input_data: "sample_data" });
-      const data = res.data;
+      const res = await axios.post(`${API_BASE}/start`, {
+        input_data: "sample_data",
+      });
+      const data = res.data as Record<string, unknown>;
+
+      if (data.success === false) {
+        const msg = apiErrorDetail(data);
+        addToast("error", "Start Failed", msg);
+        setPipelineState((prev) => ({
+          ...prev,
+          status: "failed",
+          message: msg,
+        }));
+        return;
+      }
+
+      const graphState =
+        data.state && typeof data.state === "object"
+          ? (data.state as Record<string, unknown>)
+          : {};
+      const generated =
+        typeof graphState.generated_code === "string"
+          ? graphState.generated_code
+          : "";
 
       setPipelineState({
-        status: data.status === "paused_for_approval" ? "paused" : "running",
-        current_stage: data.current_stage || "discovery",
-        thread_id: data.thread_id || null,
-        message: data.message || "Pipeline started",
-        stages_completed: data.stages_completed || [],
+        status: "paused",
+        current_stage: "transform",
+        thread_id: typeof data.thread_id === "string" ? data.thread_id : null,
+        message:
+          typeof data.message === "string"
+            ? data.message
+            : "Pipeline paused for human review.",
+        stages_completed: ["discovery"],
+        generated_code: generated,
       });
 
-      addToast("success", "Pipeline Started", data.message || "Pipeline execution initiated successfully.");
+      addToast(
+        "success",
+        "Pipeline Started",
+        typeof data.message === "string"
+          ? data.message
+          : "Paused at HITL — review generated code."
+      );
     } catch (err: unknown) {
       let msg = "Could not reach the backend. Is it running on port 8000?";
-      if (axios.isAxiosError(err) && err.response?.data?.detail) {
-        msg = err.response.data.detail;
+      if (axios.isAxiosError(err) && err.response?.data) {
+        msg = apiErrorDetail(err.response.data);
       }
       addToast("error", "Start Failed", msg);
       setPipelineState((prev) => ({
@@ -249,31 +321,53 @@ export default function Dashboard() {
       try {
         const res = await axios.post(`${API_BASE}/approve`, {
           thread_id: pipelineState.thread_id,
-          action,
+          action: action === "approve" ? "Approve" : "Reject",
         });
-        const data = res.data;
+        const data = res.data as Record<string, unknown>;
+
+        if (data.success === false) {
+          addToast("error", "Action Failed", apiErrorDetail(data));
+          return;
+        }
+
+        const graphState =
+          data.state && typeof data.state === "object"
+            ? (data.state as Record<string, unknown>)
+            : {};
+        const generated =
+          typeof graphState.generated_code === "string"
+            ? graphState.generated_code
+            : undefined;
 
         setPipelineState((prev) => ({
           ...prev,
-          status: data.status === "completed"
-            ? "completed"
-            : data.status === "paused_for_approval"
-              ? "paused"
-              : "running",
-          current_stage: data.current_stage || prev.current_stage,
-          message: data.message || `Action ${action} processed.`,
-          stages_completed: data.stages_completed || prev.stages_completed,
+          status: "completed",
+          current_stage: "orchestrator",
+          message:
+            typeof data.message === "string"
+              ? data.message
+              : `Transformation ${action}d.`,
+          stages_completed: [
+            "discovery",
+            "transform",
+            "healing",
+            "orchestrator",
+          ],
+          generated_code:
+            generated !== undefined ? generated : prev.generated_code,
         }));
 
         addToast(
           action === "approve" ? "success" : "warning",
           action === "approve" ? "Approved" : "Rejected",
-          data.message || `Transformation ${action}d successfully.`
+          typeof data.message === "string"
+            ? data.message
+            : `Transformation ${action}d successfully.`
         );
       } catch (err: unknown) {
         let msg = "Backend request failed. Please try again.";
-        if (axios.isAxiosError(err) && err.response?.data?.detail) {
-          msg = err.response.data.detail;
+        if (axios.isAxiosError(err) && err.response?.data) {
+          msg = apiErrorDetail(err.response.data);
         }
         addToast("error", "Action Failed", msg);
       } finally {
@@ -285,7 +379,7 @@ export default function Dashboard() {
 
   // ── Reset ──
   const handleReset = useCallback(() => {
-    setPipelineState(DEFAULT_STATE);
+    setPipelineState({ ...DEFAULT_STATE });
     addToast("info", "Reset", "Dashboard reset to initial state.");
   }, [addToast]);
 
@@ -408,26 +502,7 @@ export default function Dashboard() {
                 </span>
               </div>
             </div>
-            <div className="h-[220px]">
-              <ReactFlow
-                nodes={nodes}
-                edges={edges}
-                nodeTypes={nodeTypes}
-                fitView
-                fitViewOptions={{ padding: 0.3 }}
-                nodesDraggable={false}
-                nodesConnectable={false}
-                elementsSelectable={false}
-                panOnDrag={false}
-                zoomOnScroll={false}
-                zoomOnPinch={false}
-                zoomOnDoubleClick={false}
-                preventScrolling={false}
-                proOptions={{ hideAttribution: true }}
-              >
-                <Background color="#1c2333" gap={20} size={1} />
-              </ReactFlow>
-            </div>
+            <PipelineFlowGraph nodes={nodes} edges={edges} />
           </div>
 
           {/* Analytics */}
@@ -467,13 +542,13 @@ export default function Dashboard() {
             {/* Start Button */}
             <button
               onClick={handleStart}
-              disabled={loading || isRunning}
+              disabled={loading || isRunning || isPaused || isCompleted}
               className={`
                 w-full py-3 rounded-xl font-semibold text-sm
                 flex items-center justify-center gap-2
                 transition-all duration-200
                 ${
-                  loading || isRunning
+                  loading || isRunning || isPaused || isCompleted
                     ? "bg-[#1c2333] text-gray-500 cursor-not-allowed"
                     : "bg-gradient-to-r from-cyan-500 to-blue-600 text-white hover:from-cyan-400 hover:to-blue-500 hover:shadow-lg hover:shadow-cyan-500/20 active:scale-[0.98]"
                 }
@@ -541,46 +616,89 @@ export default function Dashboard() {
               </div>
             )}
 
-            <div className="flex gap-3">
-              <button
-                onClick={() => handleApproval("approve")}
-                disabled={!isPaused || approving}
-                className={`
-                  flex-1 py-2.5 rounded-xl text-xs font-semibold
-                  flex items-center justify-center gap-1.5
-                  transition-all duration-200
-                  ${
-                    isPaused && !approving
-                      ? "bg-gradient-to-r from-emerald-500 to-teal-600 text-white hover:from-emerald-400 hover:to-teal-500 hover:shadow-lg hover:shadow-emerald-500/20 active:scale-[0.98]"
-                      : "bg-[#1c2333] text-gray-600 cursor-not-allowed"
-                  }
-                `}
+            {(isPaused || pipelineState.generated_code) && (
+              <div className="mb-4">
+                <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-2">
+                  Generated code
+                </p>
+                <div className="rounded-lg border border-[#1e2a3d] bg-[#0d1117] overflow-hidden shadow-[inset_0_1px_0_rgba(255,255,255,0.04),inset_0_0_0_1px_rgba(0,0,0,0.35)]">
+                  <div className="flex items-center gap-2 px-3 py-2 bg-[#161b22] border-b border-[#1e2a3d]">
+                    <span className="text-[10px] text-gray-500 font-mono">
+                      transform_output.py
+                    </span>
+                    <span className="ml-auto flex gap-1.5">
+                      <span className="w-2.5 h-2.5 rounded-full bg-[#ff5f57]" />
+                      <span className="w-2.5 h-2.5 rounded-full bg-[#febc2e]" />
+                      <span className="w-2.5 h-2.5 rounded-full bg-[#28c840]" />
+                    </span>
+                  </div>
+                  <pre
+                    className="p-3 max-h-[220px] overflow-auto text-[11px] leading-relaxed font-mono text-[#c9d1d9] whitespace-pre-wrap break-words"
+                    style={{
+                      tabSize: 2,
+                      scrollbarGutter: "stable",
+                    }}
+                  >
+                    <code>
+                      {pipelineState.generated_code?.trim()
+                        ? pipelineState.generated_code
+                        : "—"}
+                    </code>
+                  </pre>
+                </div>
+              </div>
+            )}
+
+            {isCompleted ? (
+              <a
+                href={`${API_BASE}/download`}
+                download
+                className="w-full py-3 rounded-xl font-bold text-sm bg-gradient-to-r from-emerald-500 to-teal-500 text-white flex items-center justify-center shadow-lg shadow-emerald-500/20 hover:scale-[1.02] transition-transform"
               >
-                {approving ? (
-                  <Loader2 size={13} className="animate-spin" />
-                ) : (
-                  <CheckCircle2 size={13} />
-                )}
-                Approve
-              </button>
-              <button
-                onClick={() => handleApproval("reject")}
-                disabled={!isPaused || approving}
-                className={`
-                  flex-1 py-2.5 rounded-xl text-xs font-semibold
-                  flex items-center justify-center gap-1.5
-                  transition-all duration-200
-                  ${
-                    isPaused && !approving
-                      ? "bg-gradient-to-r from-rose-500 to-pink-600 text-white hover:from-rose-400 hover:to-pink-500 hover:shadow-lg hover:shadow-rose-500/20 active:scale-[0.98]"
-                      : "bg-[#1c2333] text-gray-600 cursor-not-allowed"
-                  }
-                `}
-              >
-                <XCircle size={13} />
-                Reject
-              </button>
-            </div>
+                Download Cleaned CSV
+              </a>
+            ) : (
+              <div className="flex gap-3">
+                <button
+                  onClick={() => handleApproval("approve")}
+                  disabled={!isPaused || approving}
+                  className={`
+                    flex-1 py-2.5 rounded-xl text-xs font-semibold
+                    flex items-center justify-center gap-1.5
+                    transition-all duration-200
+                    ${
+                      isPaused && !approving
+                        ? "bg-gradient-to-r from-emerald-500 to-teal-600 text-white hover:from-emerald-400 hover:to-teal-500 hover:shadow-lg hover:shadow-emerald-500/20 active:scale-[0.98]"
+                        : "bg-[#1c2333] text-gray-600 cursor-not-allowed"
+                    }
+                  `}
+                >
+                  {approving ? (
+                    <Loader2 size={13} className="animate-spin" />
+                  ) : (
+                    <CheckCircle2 size={13} />
+                  )}
+                  Approve
+                </button>
+                <button
+                  onClick={() => handleApproval("reject")}
+                  disabled={!isPaused || approving}
+                  className={`
+                    flex-1 py-2.5 rounded-xl text-xs font-semibold
+                    flex items-center justify-center gap-1.5
+                    transition-all duration-200
+                    ${
+                      isPaused && !approving
+                        ? "bg-gradient-to-r from-rose-500 to-pink-600 text-white hover:from-rose-400 hover:to-pink-500 hover:shadow-lg hover:shadow-rose-500/20 active:scale-[0.98]"
+                        : "bg-[#1c2333] text-gray-600 cursor-not-allowed"
+                    }
+                  `}
+                >
+                  <XCircle size={13} />
+                  Reject
+                </button>
+              </div>
+            )}
           </div>
 
           {/* ── Pipeline Stages List ── */}

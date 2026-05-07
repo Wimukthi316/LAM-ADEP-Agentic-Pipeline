@@ -27,9 +27,10 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from langgraph.types import Command
 from pydantic import BaseModel, Field
+import os
 
 from agent_graph import PipelineState, build_graph
 
@@ -196,6 +197,22 @@ async def health_check():
     return {"success": True, "message": "LAM-ADEP Pipeline API is running."}
 
 
+@app.get("/download", tags=["Pipeline"])
+async def download_cleaned_data():
+    """Download the cleaned dataset."""
+    file_path = os.path.join(os.path.dirname(__file__), "data", "cleaned_sales.csv")
+    if not os.path.exists(file_path):
+        return JSONResponse(
+            status_code=404,
+            content={"success": False, "message": "Cleaned data not found. Run pipeline first."},
+        )
+    return FileResponse(
+        path=file_path,
+        filename="cleaned_sales.csv",
+        media_type="text/csv"
+    )
+
+
 @app.post("/start", response_model=APIResponse, tags=["Pipeline"])
 async def start_pipeline(body: StartRequest):
     """Kick off the pipeline.
@@ -234,6 +251,7 @@ async def start_pipeline(body: StartRequest):
         "thread_id": thread_id,
         "message": "Pipeline paused at HITL gate. Awaiting human approval of generated code.",
         "stages_completed": ["discovery"],
+        "generated_code": current_state.get("generated_code", "") or "",
     }
 
     return APIResponse(
@@ -300,6 +318,7 @@ async def approve_pipeline(body: ApproveRequest):
         "thread_id": body.thread_id,
         "message": final_status_text,
         "stages_completed": ["discovery", "transform", "healing", "orchestrator"],
+        "generated_code": final_state.get("generated_code", "") or "",
     }
 
     return APIResponse(

@@ -275,6 +275,18 @@ def orchestrator_node(state: PipelineState) -> PipelineState:
         )
 
         code = state.get("generated_code", "")
+        
+        # ── Execute the code ───────────────────────────────────────────
+        try:
+            logger.info("[Orchestrator] Executing generated code...")
+            # Fix paths if the LLM output 'backend/data/' but we are inside 'backend/'
+            code_to_exec = code.replace("backend/data/", "data/")
+            exec(code_to_exec, globals())
+            logger.info("[Orchestrator] Code execution successful. cleaned_sales.csv should be created.")
+        except Exception as e:
+            logger.error("[Orchestrator] Code execution failed: %s", e)
+            # We still proceed to save the knowledge, or handle it as needed.
+
         collection.add(
             documents=[code],
             ids=[f"pipeline_code_{hash(code) & 0xFFFFFFFF}"],
