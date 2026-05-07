@@ -271,7 +271,8 @@ def orchestrator_node(state: PipelineState) -> PipelineState:
     try:
         import chromadb
 
-        client = chromadb.Client()  # ephemeral in-memory client
+        chroma_path = os.path.join(_BACKEND_DIR, "chroma_db")
+        client = chromadb.PersistentClient(path=chroma_path)
         collection = client.get_or_create_collection(
             name="rlhf_pipeline_knowledge",
             metadata={"description": "Approved pipeline code for RLHF"},
