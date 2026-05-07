@@ -725,7 +725,7 @@ export default function Dashboard() {
           {/* ── HITL Approval Section ── */}
           <div
             className={`glass-card p-5 transition-all duration-500 ${
-              isPaused
+              isPaused || isCompleted
                 ? "opacity-100 ring-1 ring-amber-500/30"
                 : "opacity-40 pointer-events-none"
             }`}
