@@ -232,8 +232,8 @@ async def start_pipeline(body: StartRequest):
         "status": "paused_for_approval",
         "current_stage": "transform",
         "thread_id": thread_id,
-        "message": "Pipeline paused. Awaiting human approval.",
-        "stages_completed": ["discovery"]
+        "message": "Pipeline paused at HITL gate. Awaiting human approval of generated code.",
+        "stages_completed": ["discovery"],
     }
 
     return APIResponse(
@@ -290,13 +290,16 @@ async def approve_pipeline(body: ApproveRequest):
         else "Pipeline completed — code was rejected by human reviewer."
     )
 
+    # Read the final status from graph state for accurate reporting
+    final_status_text = final_state.get("status", "Pipeline Complete")
+
     global _latest_status
     _latest_status = {
         "status": "completed",
         "current_stage": "orchestrator",
         "thread_id": body.thread_id,
-        "message": msg,
-        "stages_completed": ["discovery", "transform", "healing", "orchestrator"]
+        "message": final_status_text,
+        "stages_completed": ["discovery", "transform", "healing", "orchestrator"],
     }
 
     return APIResponse(
