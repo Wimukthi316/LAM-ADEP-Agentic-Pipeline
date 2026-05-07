@@ -23,14 +23,16 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
+import os
+
+import pandas as pd
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from langgraph.types import Command
 from pydantic import BaseModel, Field
-import os
 
 from agent_graph import PipelineState, build_graph
 
@@ -180,6 +182,96 @@ def _config_for(thread_id: str) -> dict:
     return {"configurable": {"thread_id": thread_id}}
 
 
+def _data_dir() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
+
+_CLEANED_CSV = os.path.join(_data_dir(), "cleaned_sales.csv")
+_SOURCE_CSV  = os.path.join(_data_dir(), "supermarket_sales.csv")
+
+
+def compute_analytics() -> dict[str, Any]:
+    """Load supermarket_sales.csv and return summary stats and daily aggregates."""
+    csv_path = os.path.join(_data_dir(), "supermarket_sales.csv")
+    if not os.path.isfile(csv_path):
+        return {
+            "success": False,
+            "error": "DATASET_MISSING",
+            "message": "supermarket_sales.csv was not found under backend/data.",
+        }
+
+    required = ["Unit price", "gross income", "Total", "Date"]
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as exc:
+        logger.exception("Failed to read supermarket_sales.csv")
+        return {
+            "success": False,
+            "error": "READ_FAILED",
+            "message": str(exc),
+        }
+
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        return {
+            "success": False,
+            "error": "SCHEMA_MISMATCH",
+            "message": f"Missing expected columns: {missing}",
+        }
+
+    try:
+        work = df.copy()
+        work["Date"] = pd.to_datetime(work["Date"], errors="coerce")
+        for col in ("Unit price", "gross income", "Total"):
+            work[col] = pd.to_numeric(work[col], errors="coerce")
+
+        row_count = int(len(work))
+        avg_unit_price = float(work["Unit price"].mean(skipna=True) or 0.0)
+        sum_gross_income = float(work["gross income"].sum(skipna=True) or 0.0)
+        sum_total_sales = float(work["Total"].sum(skipna=True) or 0.0)
+
+        dated = work.dropna(subset=["Date"])
+        daily = (
+            dated.groupby(dated["Date"].dt.normalize(), as_index=False)
+            .agg(
+                daily_total=("Total", "sum"),
+                daily_gross_income=("gross income", "sum"),
+            )
+            .sort_values("Date")
+            .head(10)
+        )
+        daily_sales: list[dict[str, Any]] = []
+        for _, row in daily.iterrows():
+            dt = row["Date"]
+            if pd.isna(dt):
+                continue
+            ts = pd.Timestamp(dt)
+            daily_sales.append(
+                {
+                    "date": ts.strftime("%Y-%m-%d"),
+                    "label": ts.strftime("%b %d"),
+                    "total_sales": round(float(row["daily_total"]), 2),
+                    "gross_income": round(float(row["daily_gross_income"]), 2),
+                }
+            )
+
+        return {
+            "success": True,
+            "row_count": row_count,
+            "avg_unit_price": round(avg_unit_price, 4),
+            "sum_gross_income": round(sum_gross_income, 2),
+            "sum_total_sales": round(sum_total_sales, 2),
+            "daily_sales": daily_sales,
+        }
+    except Exception as exc:
+        logger.exception("Analytics computation failed")
+        return {
+            "success": False,
+            "error": "COMPUTE_FAILED",
+            "message": str(exc),
+        }
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -199,18 +291,39 @@ async def health_check():
 
 @app.get("/download", tags=["Pipeline"])
 async def download_cleaned_data():
-    """Download the cleaned dataset."""
-    file_path = os.path.join(os.path.dirname(__file__), "data", "cleaned_sales.csv")
-    if not os.path.exists(file_path):
+    """Download cleaned_sales.csv if it exists; otherwise return a JSON error (200 OK)."""
+    if not os.path.isfile(_CLEANED_CSV):
         return JSONResponse(
-            status_code=404,
-            content={"success": False, "message": "Cleaned data not found. Run pipeline first."},
+            status_code=200,
+            content={
+                "success": False,
+                "error": "FILE_NOT_FOUND",
+                "message": (
+                    "cleaned_sales.csv is not available yet. "
+                    "Approve the pipeline so the transform step can produce it."
+                ),
+            },
         )
-    return FileResponse(
-        path=file_path,
-        filename="cleaned_sales.csv",
-        media_type="text/csv"
-    )
+    try:
+        return FileResponse(
+            path=_CLEANED_CSV,
+            filename="cleaned_sales.csv",
+            media_type="text/csv",
+        )
+    except Exception as exc:
+        logger.error("FileResponse for cleaned_sales.csv failed: %s", exc)
+        return JSONResponse(
+            status_code=200,
+            content={"success": False, "error": "SERVE_FAILED", "message": str(exc)},
+        )
+
+
+@app.get("/analytics", tags=["Analytics"])
+async def get_analytics():
+    """Real summary statistics from supermarket_sales.csv for the dashboard."""
+    result = compute_analytics()
+    # Always return 200 so the frontend can parse the error cleanly
+    return JSONResponse(status_code=200, content=result)
 
 
 @app.post("/start", response_model=APIResponse, tags=["Pipeline"])

@@ -10,15 +10,15 @@ import {
   XCircle,
   ShieldCheck,
   Activity,
-  Zap,
-  Clock,
-  TrendingDown,
   Brain,
   Radio,
+  Database,
+  DollarSign,
+  Wallet,
 } from "lucide-react";
 import { type NodeStatus } from "@/components/PipelineNode";
 import PipelineFlowGraph from "@/components/PipelineFlowGraph";
-import AnalyticsChart from "@/components/AnalyticsChart";
+import AnalyticsChart, { type DailySalesPoint } from "@/components/AnalyticsChart";
 import ToastContainer, { useToast } from "@/components/Toast";
 
 const API_BASE = "http://localhost:8000";
@@ -77,6 +77,20 @@ function mergePollIntoPipelineState(
         ? raw.generated_code
         : prev.generated_code,
   };
+}
+
+function formatUsd(n: number | undefined): string {
+  if (n == null || Number.isNaN(n)) return "—";
+  return new Intl.NumberFormat(undefined, {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: 2,
+  }).format(n);
+}
+
+function formatInt(n: number | undefined): string {
+  if (n == null || Number.isNaN(n)) return "—";
+  return n.toLocaleString();
 }
 
 function apiErrorDetail(data: unknown): string {
@@ -212,6 +226,16 @@ export default function Dashboard() {
   const [pipelineState, setPipelineState] = useState<PipelineState>(DEFAULT_STATE);
   const [loading, setLoading] = useState(false);
   const [approving, setApproving] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const [analyticsLoading, setAnalyticsLoading] = useState(true);
+  const [analyticsError, setAnalyticsError] = useState<string | null>(null);
+  const [analyticsSnapshot, setAnalyticsSnapshot] = useState<{
+    row_count: number;
+    avg_unit_price: number;
+    sum_gross_income: number;
+    sum_total_sales: number;
+    daily_sales: DailySalesPoint[];
+  } | null>(null);
   const { toasts, addToast, dismissToast } = useToast();
 
   const nodes = useMemo(() => buildNodes(pipelineState), [pipelineState]);
@@ -244,6 +268,54 @@ export default function Dashboard() {
 
     return () => clearInterval(interval);
   }, [isRunning, isPaused]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await axios.get(`${API_BASE}/analytics`);
+        const d = res.data as Record<string, unknown>;
+        if (cancelled) return;
+        if (d.success === false) {
+          setAnalyticsError(
+            typeof d.message === "string" ? d.message : "Analytics unavailable."
+          );
+          setAnalyticsSnapshot(null);
+          return;
+        }
+        setAnalyticsError(null);
+        const dailyRaw = Array.isArray(d.daily_sales) ? d.daily_sales : [];
+        const daily_sales: DailySalesPoint[] = dailyRaw.map((p) => {
+          const x = p as Record<string, unknown>;
+          return {
+            date: typeof x.date === "string" ? x.date : "",
+            label: typeof x.label === "string" ? x.label : "",
+            total_sales: Number(x.total_sales) || 0,
+            gross_income: Number(x.gross_income) || 0,
+          };
+        });
+        setAnalyticsSnapshot({
+          row_count: Number(d.row_count) || 0,
+          avg_unit_price: Number(d.avg_unit_price) || 0,
+          sum_gross_income: Number(d.sum_gross_income) || 0,
+          sum_total_sales: Number(d.sum_total_sales) || 0,
+          daily_sales,
+        });
+      } catch {
+        if (!cancelled) {
+          setAnalyticsError(
+            "Could not load analytics. Is the backend running on port 8000?"
+          );
+          setAnalyticsSnapshot(null);
+        }
+      } finally {
+        if (!cancelled) setAnalyticsLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // ── Start Pipeline ──
   const handleStart = useCallback(async () => {
@@ -383,6 +455,55 @@ export default function Dashboard() {
     addToast("info", "Reset", "Dashboard reset to initial state.");
   }, [addToast]);
 
+  const handleDownloadCleanedCsv = useCallback(async () => {
+    setDownloading(true);
+    try {
+      const res = await fetch(`${API_BASE}/download`, { method: "GET" });
+      const ct = res.headers.get("content-type") || "";
+
+      if (ct.includes("application/json")) {
+        const data = (await res.json().catch(() => ({}))) as Record<
+          string,
+          unknown
+        >;
+        const msg =
+          typeof data.message === "string"
+            ? data.message
+            : "Cleaned file is not ready yet.";
+        addToast("error", "Download not available", msg);
+        return;
+      }
+
+      if (!res.ok) {
+        addToast(
+          "error",
+          "Download failed",
+          `Unexpected response (${res.status}).`
+        );
+        return;
+      }
+
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "cleaned_sales.csv";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      addToast("success", "Download started", "Saving cleaned_sales.csv");
+    } catch {
+      addToast(
+        "error",
+        "Download failed",
+        "Network error — check that the API is reachable on port 8000."
+      );
+    } finally {
+      setDownloading(false);
+    }
+  }, [addToast]);
+
   // ── Status color ──
   const statusColor = isPaused
     ? "text-amber-400"
@@ -444,31 +565,44 @@ export default function Dashboard() {
           {/* Stat Cards */}
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
             <StatCard
-              icon={<Clock size={18} />}
-              label="Avg MTTR"
-              value="4 min"
-              trend="↓ 91%"
+              icon={<Database size={18} />}
+              label="Records"
+              value={
+                analyticsLoading
+                  ? "…"
+                  : formatInt(analyticsSnapshot?.row_count)
+              }
+              color="text-amber-400"
+            />
+            <StatCard
+              icon={<DollarSign size={18} />}
+              label="Avg unit price"
+              value={
+                analyticsLoading
+                  ? "…"
+                  : formatUsd(analyticsSnapshot?.avg_unit_price)
+              }
               color="text-cyan-400"
             />
             <StatCard
-              icon={<Zap size={18} />}
-              label="Autonomy"
-              value="94%"
-              trend="↑ 82%"
-              color="text-purple-400"
-            />
-            <StatCard
-              icon={<TrendingDown size={18} />}
-              label="Incidents"
-              value="3"
-              trend="↓ 93%"
+              icon={<Wallet size={18} />}
+              label="Sum gross income"
+              value={
+                analyticsLoading
+                  ? "…"
+                  : formatUsd(analyticsSnapshot?.sum_gross_income)
+              }
               color="text-emerald-400"
             />
             <StatCard
               icon={<Activity size={18} />}
-              label="Pipelines"
-              value="847"
-              color="text-amber-400"
+              label="Total sales"
+              value={
+                analyticsLoading
+                  ? "…"
+                  : formatUsd(analyticsSnapshot?.sum_total_sales)
+              }
+              color="text-purple-400"
             />
           </div>
 
@@ -512,10 +646,14 @@ export default function Dashboard() {
                 Performance Analytics
               </h2>
               <p className="text-[11px] text-gray-500 mt-0.5">
-                LAM adaptive learning metrics
+                Live metrics from supermarket_sales.csv
               </p>
             </div>
-            <AnalyticsChart />
+            <AnalyticsChart
+              dailySales={analyticsSnapshot?.daily_sales ?? []}
+              loading={analyticsLoading}
+              errorMessage={analyticsError}
+            />
           </div>
         </div>
 
@@ -616,47 +754,22 @@ export default function Dashboard() {
               </div>
             )}
 
-            {(isPaused || pipelineState.generated_code) && (
-              <div className="mb-4">
-                <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-2">
-                  Generated code
-                </p>
-                <div className="rounded-lg border border-[#1e2a3d] bg-[#0d1117] overflow-hidden shadow-[inset_0_1px_0_rgba(255,255,255,0.04),inset_0_0_0_1px_rgba(0,0,0,0.35)]">
-                  <div className="flex items-center gap-2 px-3 py-2 bg-[#161b22] border-b border-[#1e2a3d]">
-                    <span className="text-[10px] text-gray-500 font-mono">
-                      transform_output.py
-                    </span>
-                    <span className="ml-auto flex gap-1.5">
-                      <span className="w-2.5 h-2.5 rounded-full bg-[#ff5f57]" />
-                      <span className="w-2.5 h-2.5 rounded-full bg-[#febc2e]" />
-                      <span className="w-2.5 h-2.5 rounded-full bg-[#28c840]" />
-                    </span>
-                  </div>
-                  <pre
-                    className="p-3 max-h-[220px] overflow-auto text-[11px] leading-relaxed font-mono text-[#c9d1d9] whitespace-pre-wrap break-words"
-                    style={{
-                      tabSize: 2,
-                      scrollbarGutter: "stable",
-                    }}
-                  >
-                    <code>
-                      {pipelineState.generated_code?.trim()
-                        ? pipelineState.generated_code
-                        : "—"}
-                    </code>
-                  </pre>
-                </div>
-              </div>
-            )}
-
             {isCompleted ? (
-              <a
-                href={`${API_BASE}/download`}
-                download
-                className="w-full py-3 rounded-xl font-bold text-sm bg-gradient-to-r from-emerald-500 to-teal-500 text-white flex items-center justify-center shadow-lg shadow-emerald-500/20 hover:scale-[1.02] transition-transform"
+              <button
+                type="button"
+                onClick={handleDownloadCleanedCsv}
+                disabled={downloading}
+                className="w-full py-3 rounded-xl font-bold text-sm bg-gradient-to-r from-emerald-500 to-teal-500 text-white flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/20 hover:scale-[1.02] transition-transform disabled:opacity-60 disabled:cursor-not-allowed disabled:hover:scale-100"
               >
-                Download Cleaned CSV
-              </a>
+                {downloading ? (
+                  <>
+                    <Loader2 size={16} className="animate-spin" />
+                    Preparing download…
+                  </>
+                ) : (
+                  "Download Cleaned CSV"
+                )}
+              </button>
             ) : (
               <div className="flex gap-3">
                 <button
@@ -700,6 +813,33 @@ export default function Dashboard() {
               </div>
             )}
           </div>
+
+          {/* ── Generated Code Viewer — always visible when code exists ── */}
+          {pipelineState.generated_code.trim() && (
+            <div className="glass-card p-5">
+              <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-2">
+                Generated Code
+              </p>
+              <div className="rounded-lg border border-[#1e2a3d] bg-[#0d1117] overflow-hidden shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
+                <div className="flex items-center gap-2 px-3 py-2 bg-[#161b22] border-b border-[#1e2a3d]">
+                  <span className="text-[10px] text-gray-500 font-mono">
+                    transform_output.py
+                  </span>
+                  <span className="ml-auto flex gap-1.5">
+                    <span className="w-2.5 h-2.5 rounded-full bg-[#ff5f57]" />
+                    <span className="w-2.5 h-2.5 rounded-full bg-[#febc2e]" />
+                    <span className="w-2.5 h-2.5 rounded-full bg-[#28c840]" />
+                  </span>
+                </div>
+                <pre
+                  className="p-3 max-h-[260px] overflow-auto text-[11px] leading-relaxed font-mono text-[#c9d1d9] whitespace-pre-wrap break-words"
+                  style={{ tabSize: 2, scrollbarGutter: "stable" }}
+                >
+                  <code>{pipelineState.generated_code}</code>
+                </pre>
+              </div>
+            </div>
+          )}
 
           {/* ── Pipeline Stages List ── */}
           <div className="glass-card p-5">
