@@ -188,6 +188,30 @@ def compute_analytics(csv_path: str | None = None) -> dict[str, Any]:
     }
 
 
+def _empty_analytics_payload(note: str | None = None) -> dict[str, Any]:
+    """Stable shape when no CSV is available or analytics fails."""
+    body: dict[str, Any] = {
+        "success": True,
+        "row_count": 0,
+        "avg_unit_price": 0.0,
+        "sum_gross_income": 0.0,
+        "sum_total_sales": 0.0,
+        "daily_sales": [],
+        "dataset_file": None,
+    }
+    if note:
+        body["note"] = note
+    return body
+
+
+def _chroma_seq(val: Any) -> list[Any]:
+    if val is None:
+        return []
+    if isinstance(val, (list, tuple)):
+        return list(val)
+    return [val]
+
+
 # ── App Lifespan ─────────────────────────────────────────────────────────────
 _compiled_graph = None
 
@@ -208,22 +232,35 @@ app = FastAPI(
     description="Metadata-First + Healing Loop + Dynamic Upload",
     lifespan=lifespan,
 )
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
-                   allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def _safe_json(data: dict[str, Any], status_code: int = 200) -> JSONResponse:
+    """JSONResponse expects content=…; never pass (status_code, body) positionally."""
+    return JSONResponse(content=data, status_code=status_code)
 
 
 # ── Exception Handlers ────────────────────────────────────────────────────────
 
 @app.exception_handler(RequestValidationError)
 async def _val_err(request: Request, exc: RequestValidationError):
-    return JSONResponse(200, {"success": False, "error": "Validation Error", "detail": exc.errors()})
+    return _safe_json({"success": False, "error": "Validation Error", "detail": exc.errors()})
 
 
 @app.exception_handler(Exception)
 async def _global_err(request: Request, exc: Exception):
     logger.error("Unhandled: %s %s — %s", request.method, request.url.path, exc, exc_info=True)
-    return JSONResponse(200, {"success": False, "error": str(exc),
-                               "detail": traceback.format_exception_only(type(exc), exc)[-1].strip()})
+    return _safe_json({
+        "success": False,
+        "error": str(exc),
+        "detail": traceback.format_exception_only(type(exc), exc)[-1].strip(),
+    })
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -287,7 +324,7 @@ async def upload_dataset(file: UploadFile = File(...)):
     global _active_csv_path
 
     if not file.filename or not file.filename.lower().endswith(".csv"):
-        return JSONResponse(200, {
+        return _safe_json({
             "success": False, "error": "Only CSV files are accepted.",
         })
 
@@ -297,7 +334,7 @@ async def upload_dataset(file: UploadFile = File(...)):
     try:
         contents = await file.read()
         if len(contents) > 50 * 1024 * 1024:   # 50 MB limit
-            return JSONResponse(200, {"success": False, "error": "File exceeds 50 MB limit."})
+            return _safe_json({"success": False, "error": "File exceeds 50 MB limit."})
 
         os.makedirs(_DATA_DIR, exist_ok=True)
         with open(dest_path, "wb") as f:
@@ -308,7 +345,7 @@ async def upload_dataset(file: UploadFile = File(...)):
         _active_csv_path = dest_path
 
         logger.info("[Upload] Saved %s (%d bytes, %d cols)", safe_name, len(contents), len(df_check.columns))
-        return JSONResponse(200, {
+        return _safe_json({
             "success":      True,
             "csv_filename": safe_name,
             "path":         dest_path,
@@ -318,7 +355,7 @@ async def upload_dataset(file: UploadFile = File(...)):
 
     except Exception as exc:
         logger.error("[Upload] Failed: %s", exc)
-        return JSONResponse(200, {"success": False, "error": str(exc)})
+        return _safe_json({"success": False, "error": str(exc)})
 
 
 @app.get("/download", tags=["Pipeline"])
@@ -332,33 +369,74 @@ async def download_cleaned(csv_filename: Optional[str] = None):
         path = None
 
     if not path or not os.path.isfile(path):
-        return JSONResponse(200, {"success": False, "error": "FILE_NOT_FOUND",
-                                   "message": "Cleaned CSV not ready yet."})
+        return _safe_json({"success": False, "error": "FILE_NOT_FOUND",
+                           "message": "Cleaned CSV not ready yet."})
     return FileResponse(path=path, filename=os.path.basename(path), media_type="text/csv")
 
 
 @app.get("/analytics", tags=["Analytics"])
 async def get_analytics(csv_filename: Optional[str] = None):
-    path = resolve_analytics_csv(csv_filename)
-    return JSONResponse(200, compute_analytics(path))
+    try:
+        path = resolve_analytics_csv(csv_filename)
+        if not path or not os.path.isfile(path):
+            return _safe_json(_empty_analytics_payload("no_csv_uploaded_or_found"))
+        payload = compute_analytics(path)
+        if payload.get("success") is False:
+            return _safe_json(_empty_analytics_payload(str(payload.get("message", ""))))
+        return _safe_json(dict(payload))
+    except Exception as exc:
+        logger.warning("[Analytics] degraded empty response: %s", exc, exc_info=True)
+        return _safe_json(_empty_analytics_payload("analytics_error"))
 
 
 @app.get("/memory", tags=["RLHF"])
 async def get_memory():
-    """Return all approved scripts stored in ChromaDB."""
+    """Return approved scripts from ChromaDB; never 500 on empty/missing/invalid store."""
+    memory: list[dict[str, Any]] = []
     try:
         import chromadb  # type: ignore
-        client     = chromadb.PersistentClient(path=os.path.join(_BACKEND_DIR, "chroma_db"))
+
+        chroma_dir = os.path.join(_BACKEND_DIR, "chroma_db")
+        os.makedirs(chroma_dir, exist_ok=True)
+        client     = chromadb.PersistentClient(path=chroma_dir)
         collection = client.get_or_create_collection("rlhf_pipeline_knowledge")
-        results = collection.get(include=["documents", "metadatas"])
-        docs  = results.get("documents") or []
-        metas = results.get("metadatas") or []
+        results    = collection.get(include=["documents", "metadatas"])
+
+        if not isinstance(results, dict):
+            return _safe_json({"success": True, "count": 0, "items": [], "memory": []})
+
+        docs  = _chroma_seq(results.get("documents"))
+        metas = _chroma_seq(results.get("metadatas"))
         n     = min(len(docs), len(metas))
-        items = [{"code": docs[i], "metadata": metas[i]} for i in range(n)]
-        return JSONResponse(200, {"success": True, "count": len(items), "items": items})
+
+        for i in range(n):
+            try:
+                doc_raw, meta_raw = docs[i], metas[i]
+                if doc_raw is None and meta_raw is None:
+                    continue
+                code = doc_raw if isinstance(doc_raw, str) else (
+                    "" if doc_raw is None else str(doc_raw)
+                )
+                if isinstance(meta_raw, dict):
+                    meta: dict[str, Any] = dict(meta_raw)
+                elif meta_raw is None:
+                    meta = {}
+                else:
+                    meta = {"value": meta_raw}
+                memory.append({"code": code, "metadata": meta})
+            except Exception:
+                continue
+    except ModuleNotFoundError:
+        logger.warning("[Memory] chromadb not installed; returning empty memory.")
     except Exception as exc:
-        logger.error("[Memory] ChromaDB read failed: %s", exc)
-        return JSONResponse(200, {"success": False, "error": str(exc), "items": []})
+        logger.warning("[Memory] returning empty memory: %s", exc, exc_info=True)
+
+    return _safe_json({
+        "success": True,
+        "count":   len(memory),
+        "items":   memory,
+        "memory":  memory,
+    })
 
 
 @app.post("/start", response_model=APIResponse, tags=["Pipeline"])
