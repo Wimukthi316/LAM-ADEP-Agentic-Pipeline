@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
+import { PipelineProvider } from "@/components/PipelineProvider";
+import AppShell from "@/components/AppShell";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -29,7 +31,9 @@ export default function RootLayout({
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased dark`}
     >
       <body suppressHydrationWarning className="min-h-full flex flex-col bg-[#06080f] text-[#e4e8f1]">
-        {children}
+        <PipelineProvider>
+          <AppShell>{children}</AppShell>
+        </PipelineProvider>
       </body>
     </html>
   );

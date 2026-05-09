@@ -61,17 +61,22 @@ export default function AnalyticsChart({
   dailySales,
   loading,
   errorMessage,
+  datasetSubtitle,
 }: {
   dailySales: DailySalesPoint[];
   loading: boolean;
   errorMessage: string | null;
+  /** Shown in subtitle when set (e.g. active CSV basename). */
+  datasetSubtitle?: string | null;
 }) {
   const empty = !loading && (!dailySales || dailySales.length === 0);
   const subtitle = loading
     ? "Loading dataset metrics…"
     : errorMessage
       ? errorMessage
-      : "Daily totals from supermarket_sales.csv (first 10 days)";
+      : datasetSubtitle
+        ? `Daily totals from ${datasetSubtitle} (sample series)`
+        : "Daily totals from the active dataset (first 10 days)";
 
   const chartBlock = (
     msg: string,
