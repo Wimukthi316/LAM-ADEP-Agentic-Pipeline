@@ -569,11 +569,19 @@ async def approve_pipeline(body: ApproveRequest):
                 df.drop_duplicates(inplace=True)
                 if "Date" in df.columns:
                     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-                num_cols = df.select_dtypes(include=["number"]).columns
+                num_cols = list(df.select_dtypes(include=["number"]).columns)
                 for c in num_cols:
-                    if df[c].isna().any():
-                        _m = df[c].median()
-                        df[c] = df[c].fillna(0 if pd.isna(_m) else _m)
+                    if not df[c].isna().any():
+                        continue
+                    _med = df[c].median()
+                    if pd.notna(_med):
+                        df[c] = df[c].fillna(_med)
+                        continue
+                    _mean = df[c].mean()
+                    if pd.notna(_mean):
+                        df[c] = df[c].fillna(_mean)
+                        continue
+                    df.drop(columns=[c], inplace=True)
                 for c in df.select_dtypes(include=["object", "string"]).columns:
                     df[c] = df[c].fillna("")
                 df.dropna(how="all", inplace=True)

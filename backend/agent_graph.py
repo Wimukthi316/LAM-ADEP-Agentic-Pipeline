@@ -80,10 +80,18 @@ TRANSFORM_CODE_FALLBACK = (
     "import pandas as pd\n\n"
     "df = pd.read_csv(INPUT_CSV, low_memory=False)\n"
     "df.drop_duplicates(inplace=True)\n"
-    "for _col in df.select_dtypes(include=['number']).columns:\n"
-    "    if df[_col].isna().any():\n"
-    "        _m = df[_col].median()\n"
-    "        df[_col] = df[_col].fillna(0 if pd.isna(_m) else _m)\n"
+    "for _col in list(df.select_dtypes(include=['number']).columns):\n"
+    "    if not df[_col].isna().any():\n"
+    "        continue\n"
+    "    _med = df[_col].median()\n"
+    "    if pd.notna(_med):\n"
+    "        df[_col] = df[_col].fillna(_med)\n"
+    "        continue\n"
+    "    _mean = df[_col].mean()\n"
+    "    if pd.notna(_mean):\n"
+    "        df[_col] = df[_col].fillna(_mean)\n"
+    "        continue\n"
+    "    df.drop(columns=[_col], inplace=True)\n"
     "for _col in df.select_dtypes(include=['object', 'string']).columns:\n"
     "    df[_col] = df[_col].fillna('')\n"
     "df.dropna(how='all', inplace=True)\n"
@@ -94,8 +102,8 @@ TRANSFORM_CODE_FALLBACK = (
 
 _GEMINI_TRANSFORM_RULES = """CRITICAL RULES YOU MUST FOLLOW:
 1. NO SAMPLING: NEVER use `nrows`, `.head()`, or any sampling inside or chained from `pd.read_csv()`. Load the full dataset with `pd.read_csv(INPUT_CSV, low_memory=False)`.
-2. DYNAMIC PATHS: NEVER hardcode local paths. ONLY use `INPUT_CSV` and `OUTPUT_CSV` for reading and writing (injected by the runtime sandbox).
-3. DATA HYGIENE FIRST: Before task-specific logic, always `df.drop_duplicates(inplace=True)` and handle missing values logically (`dropna` and/or `fillna` by dtype).
+2. GLOBALLY DEFINED PATHS: NEVER assign or redefine `INPUT_CSV` or `OUTPUT_CSV`. They exist in the runtime; use them only as `pd.read_csv(INPUT_CSV)` and `df.to_csv(OUTPUT_CSV, index=False)`. Never hardcode disk paths.
+3. DATA HYGIENE & SMART IMPUTATION: Always `df.drop_duplicates(inplace=True)`. NEVER blindly `fillna(0)` on numeric columns. Use per-column median or mean where sensible; if a numeric column cannot be imputed without distorting metrics (e.g. no valid median/mean), drop that column or rows per sound judgment — do not zero-fill by default.
 4. OUTPUT FORMAT: Save only with `df.to_csv(OUTPUT_CSV, index=False)`.
 5. OUTPUT ONLY CODE: Return ONLY executable Python — no markdown fences, no explanations."""
 
