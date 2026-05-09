@@ -131,6 +131,33 @@ function apiResponseToPipelineUI(
   };
 }
 
+function pausedStateToPipelineUI(
+  state: Record<string, unknown>,
+  threadId: string
+): Partial<PipelineUIState> {
+  const generated =
+    typeof state.generated_code === "string" ? state.generated_code : "";
+  const hit = state.healing_iterations;
+  const healing_iterations =
+    typeof hit === "number"
+      ? hit
+      : typeof hit === "string"
+        ? parseInt(hit, 10) || 0
+        : 0;
+  return {
+    status: "paused",
+    current_stage: "transform",
+    thread_id: threadId,
+    message:
+      typeof state.status === "string"
+        ? state.status
+        : "Paused for human review.",
+    stages_completed: ["discovery"],
+    generated_code: generated,
+    healing_iterations,
+  };
+}
+
 export function PipelineProvider({ children }: { children: React.ReactNode }) {
   const { toasts, addToast, dismissToast } = useToast();
   const [pipeline, setPipeline] = useState<PipelineUIState>(DEFAULT_PIPELINE_UI);
@@ -158,6 +185,12 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
   const isPaused = pipeline.status === "paused";
 
   useEffect(() => {
+    if (pipeline.thread_id) {
+      window.localStorage.setItem("lam_adep_thread_id", pipeline.thread_id);
+    }
+  }, [pipeline.thread_id]);
+
+  useEffect(() => {
     if (isPaused && pipeline.generated_code)
       setEditedCode(pipeline.generated_code);
   }, [isPaused, pipeline.generated_code]);
@@ -178,6 +211,40 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
     }, 2000);
     return () => clearInterval(interval);
   }, [isRunning, isPaused]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await axios.get(`${API_BASE}/status`);
+        if (!res.data || typeof res.data !== "object" || cancelled) return;
+        const raw = res.data as Record<string, unknown>;
+        if (raw.status === "paused_for_approval") {
+          setPipeline((prev) => mergePollIntoPipelineState(raw, prev));
+          return;
+        }
+        const cachedThread = window.localStorage.getItem("lam_adep_thread_id");
+        if (!cachedThread) return;
+        const tRes = await axios.get(`${API_BASE}/state/${cachedThread}`);
+        const tData = tRes.data as Record<string, unknown>;
+        if (cancelled || tData.success === false || tData.paused !== true) return;
+        const rawState =
+          tData.state && typeof tData.state === "object"
+            ? (tData.state as Record<string, unknown>)
+            : {};
+        const ui = pausedStateToPipelineUI(rawState, cachedThread);
+        setPipeline((prev) => ({ ...prev, ...ui }));
+        if (typeof ui.generated_code === "string" && ui.generated_code.trim()) {
+          setEditedCode(ui.generated_code);
+        }
+      } catch {
+        /* ignore hydration failure */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const refreshAnalytics = useCallback(async () => {
     setAnalyticsLoading(true);
@@ -306,6 +373,10 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
 
       const pausedFlag = (data.paused as boolean | undefined) !== false;
       const ui = apiResponseToPipelineUI(data, pausedFlag);
+      setPipeline((prev) => ({ ...prev, ...ui }));
+      if (typeof ui.generated_code === "string" && ui.generated_code.trim()) {
+        setEditedCode(ui.generated_code);
+      }
       addToast(
         "success",
         "Pipeline Started",
@@ -344,6 +415,13 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
       const paused = data.paused === true;
       const ui = apiResponseToPipelineUI(data, paused);
       setPipeline((prev) => ({ ...prev, ...ui }));
+      if (
+        paused &&
+        typeof ui.generated_code === "string" &&
+        ui.generated_code.trim()
+      ) {
+        setEditedCode(ui.generated_code);
+      }
       addToast(
         paused ? "info" : "success",
         paused ? "Regenerated" : "Approved",
@@ -379,6 +457,9 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
         }
         const ui = apiResponseToPipelineUI(data, true);
         setPipeline((prev) => ({ ...prev, ...ui }));
+        if (typeof ui.generated_code === "string" && ui.generated_code.trim()) {
+          setEditedCode(ui.generated_code);
+        }
         addToast(
           "success",
           "Feedback sent",

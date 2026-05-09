@@ -32,6 +32,7 @@ export default function HitlPage() {
 
   const isPaused = pipeline.status === "paused";
   const isCompleted = pipeline.status === "completed";
+  const codeForEditor = editedCode.trim() ? editedCode : pipeline.generated_code;
 
   const submitReject = async () => {
     await rejectPipeline(feedback || "Please improve this transformation.");
@@ -130,7 +131,7 @@ export default function HitlPage() {
         </div>
       </div>
 
-      {(isPaused || isCompleted) && editedCode.trim() ? (
+      {(isPaused || isCompleted) && codeForEditor.trim() ? (
         <div className="glass-card p-5">
           <div className="flex items-center justify-between mb-3">
             <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">
@@ -152,7 +153,7 @@ export default function HitlPage() {
               height="420px"
               language="python"
               theme="vs-dark"
-              value={editedCode}
+              value={codeForEditor}
               onChange={(val) => setEditedCode(val ?? "")}
               options={{
                 readOnly: isCompleted,

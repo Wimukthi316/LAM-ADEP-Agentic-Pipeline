@@ -5,7 +5,7 @@ Metadata-First Architecture v3 — ydata-profiling + Healing Loop + Dynamic CSV
 
 Architecture
 ------------
-- LLM         : Google Gemini 1.5 Flash (google.generativeai)
+- LLM         : Google Gemini 2.5 Flash (google.generativeai)
 - Profiler     : ydata-profiling minimal → surgical JSON extraction (≤6 KB)
                  Fallback: custom pandas profiler if ydata-profiling unavailable
 - Vector DB   : ChromaDB persistent (RLHF knowledge store)
@@ -78,15 +78,33 @@ TRANSFORM_CODE_FALLBACK = (
     "# Fallback: Gemini did not return valid code.\n"
     "# Please check GEMINI_API_KEY and retry.\n"
     "import pandas as pd\n\n"
-    "df = pd.read_csv(CSV_PATH).head(200)\n"
+    "df = pd.read_csv(INPUT_CSV, low_memory=False)\n"
     "df.drop_duplicates(inplace=True)\n"
-    "df.to_csv(CLEANED_PATH, index=False)\n"
-    "print(f'Fallback: {len(df)} rows saved to CLEANED_PATH')\n"
+    "for _col in df.select_dtypes(include=['number']).columns:\n"
+    "    if df[_col].isna().any():\n"
+    "        _m = df[_col].median()\n"
+    "        df[_col] = df[_col].fillna(0 if pd.isna(_m) else _m)\n"
+    "for _col in df.select_dtypes(include=['object', 'string']).columns:\n"
+    "    df[_col] = df[_col].fillna('')\n"
+    "df.dropna(how='all', inplace=True)\n"
+    "df.to_csv(OUTPUT_CSV, index=False)\n"
+    "print(f'Fallback: wrote {len(df)} rows to OUTPUT_CSV')\n"
 )
 
 
+_GEMINI_TRANSFORM_RULES = """CRITICAL RULES YOU MUST FOLLOW:
+1. NO SAMPLING: NEVER use `nrows`, `.head()`, or any sampling inside or chained from `pd.read_csv()`. Load the full dataset with `pd.read_csv(INPUT_CSV, low_memory=False)`.
+2. DYNAMIC PATHS: NEVER hardcode local paths. ONLY use `INPUT_CSV` and `OUTPUT_CSV` for reading and writing (injected by the runtime sandbox).
+3. DATA HYGIENE FIRST: Before task-specific logic, always `df.drop_duplicates(inplace=True)` and handle missing values logically (`dropna` and/or `fillna` by dtype).
+4. OUTPUT FORMAT: Save only with `df.to_csv(OUTPUT_CSV, index=False)`.
+5. OUTPUT ONLY CODE: Return ONLY executable Python — no markdown fences, no explanations."""
+
+
+GEMINI_MODEL = "models/gemini-2.5-flash"
+
+
 def _get_gemini():
-    """Lazy-init Gemini 1.5 Flash. Raises RuntimeError if key is missing."""
+    """Lazy-init Gemini (google.generativeai). Raises RuntimeError if key is missing."""
     global _gemini_model
     if _gemini_model is None:
         import google.generativeai as genai  # type: ignore
@@ -97,8 +115,8 @@ def _get_gemini():
                 f"GEMINI_API_KEY is not set. Add it to {_ENV_PATH} and restart."
             )
         genai.configure(api_key=api_key)
-        _gemini_model = genai.GenerativeModel("gemini-1.5-flash")
-        logger.info("Gemini 1.5 Flash initialised.")
+        _gemini_model = genai.GenerativeModel(GEMINI_MODEL)
+        logger.info("Gemini model initialised: %s", GEMINI_MODEL)
     return _gemini_model
 
 
@@ -352,11 +370,11 @@ def discovery_node(state: PipelineState) -> PipelineState:
 
 
 # ---------------------------------------------------------------------------
-# Node 2 — Transform Agent (Gemini 1.5 Flash)
+# Node 2 — Transform Agent (Gemini 2.5 Flash)
 # ---------------------------------------------------------------------------
 
 def transform_node(state: PipelineState) -> PipelineState:
-    """Send metadata JSON to Gemini 1.5 Flash and extract Python cleaning code.
+    """Send metadata JSON to Gemini and extract Python cleaning code.
 
     On the first run, sends the standard data-engineering prompt.
     On subsequent runs (after rejection), sends a *corrective* prompt that
@@ -372,39 +390,32 @@ def transform_node(state: PipelineState) -> PipelineState:
         "[Transform] Generating code via Gemini (iter=%d, corrective=%s)",
         healing_iterations, bool(rejection_feedback),
     )
+    logger.info("[Transform] Sandbox paths INPUT_CSV=%s OUTPUT_CSV=%s", csv_path, cleaned_path)
 
     if rejection_feedback:
         # ── Corrective prompt ──────────────────────────────────────────
         prompt = (
-            "You are an expert Data Engineer. Your previous Python data cleaning script "
-            "was rejected by a human reviewer with the following feedback:\n\n"
+            "You are an expert Data Engineer Python Agent. Write production-ready pandas "
+            "code that transforms the dataset according to reviewer feedback and schema hints.\n\n"
+            f"{_GEMINI_TRANSFORM_RULES}\n\n"
             f"REJECTION FEEDBACK: \"{rejection_feedback}\"\n\n"
-            "The dataset metadata profile is:\n"
+            "Dataset metadata profile (JSON):\n"
             f"```json\n{metadata_json}\n```\n\n"
-            "Write a CORRECTED, complete, self-contained Python script that:\n"
-            "1. Directly addresses the reviewer's feedback.\n"
-            f"2. Loads the CSV from: {csv_path!r}\n"
-            "3. Takes only the first 200 rows.\n"
-            "4. Applies all required cleaning steps.\n"
-            f"5. Saves the result to: {cleaned_path!r}\n"
-            "6. Prints a summary of rows written.\n\n"
-            "IMPORTANT: Return ONLY raw Python code. No markdown fences. No explanation."
+            "Write a CORRECTED script that applies hygiene first, then directly addresses "
+            "the feedback with appropriate transformations for this schema.\n"
+            "Print a short summary line with final row count.\n"
         )
     else:
         # ── First-run prompt ───────────────────────────────────────────
         prompt = (
-            "You are an expert Data Engineer. Below is a ydata-profiling JSON metadata "
-            "summary of a CSV dataset (first 200 rows).\n\n"
+            "You are an expert Data Engineer Python Agent. Write production-ready pandas "
+            "code to clean and transform the dataset described below.\n\n"
+            f"{_GEMINI_TRANSFORM_RULES}\n\n"
+            "Dataset metadata profile (JSON):\n"
             f"```json\n{metadata_json}\n```\n\n"
-            "Write a complete, self-contained Python script using pandas that:\n"
-            f"1. Loads the CSV from the absolute path: {csv_path!r}\n"
-            "2. Takes only the first 200 rows.\n"
-            "3. Applies at least 3 data cleaning steps appropriate for this dataset "
-            "(e.g. parse date columns, coerce numeric types, drop duplicates, "
-            "handle nulls, rename columns, handle outliers).\n"
-            f"4. Saves the cleaned DataFrame to: {cleaned_path!r}\n"
-            "5. Prints a summary of rows written.\n\n"
-            "IMPORTANT: Return ONLY raw Python code. No markdown fences. No explanation."
+            "After hygiene, apply at least three meaningful transformations suited to this "
+            "schema (e.g. parse dates, coerce numerics, standardize strings, outliers).\n"
+            "Print a short summary line with final row count.\n"
         )
 
     generated_code = TRANSFORM_CODE_FALLBACK

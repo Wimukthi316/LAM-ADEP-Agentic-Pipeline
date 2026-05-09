@@ -54,7 +54,13 @@ def _sandbox_worker(
 
         sys.stdout, sys.stderr = stdout_buf, stderr_buf
         exec(compile(code, "<sandbox>", "exec"),  # noqa: S102
-             {"__builtins__": __builtins__, "CSV_PATH": csv_path, "CLEANED_PATH": cleaned_path})
+             {
+                 "__builtins__": __builtins__,
+                 "CSV_PATH": csv_path,
+                 "CLEANED_PATH": cleaned_path,
+                 "INPUT_CSV": csv_path,
+                 "OUTPUT_CSV": cleaned_path,
+             })
         sys.stdout, sys.stderr = sys.__stdout__, sys.__stderr__
         result_queue.put({"success": True, "stdout": stdout_buf.getvalue(), "stderr": stderr_buf.getvalue()})
     except Exception as exc:
@@ -314,6 +320,26 @@ async def get_status():
     return _latest_status
 
 
+@app.get("/state/{thread_id}", tags=["Pipeline"])
+async def get_thread_state(thread_id: str):
+    """Return raw graph checkpoint state for a thread (used by HITL UI hydration)."""
+    try:
+        config = _cfg(thread_id)
+        snapshot = _compiled_graph.get_state(config)
+        if not snapshot:
+            return _safe_json({"success": False, "error": "THREAD_NOT_FOUND", "state": {}})
+        values = _to_dict(snapshot)
+        return _safe_json({
+            "success": True,
+            "thread_id": thread_id,
+            "paused": bool(snapshot.next),
+            "state": values,
+        })
+    except Exception as exc:
+        logger.warning("[State] failed for thread %s: %s", thread_id, exc, exc_info=True)
+        return _safe_json({"success": False, "error": "STATE_READ_FAILED", "state": {}})
+
+
 @app.post("/upload", tags=["Data"])
 async def upload_dataset(file: UploadFile = File(...)):
     """Upload a CSV dataset. Saves to backend/data/<filename>.
@@ -539,10 +565,18 @@ async def approve_pipeline(body: ApproveRequest):
         if not sandbox_result.get("success"):
             logger.warning("[Approve] Sandbox failed — guaranteed fallback.")
             try:
-                df = pd.read_csv(csv_path).head(200)
+                df = pd.read_csv(csv_path, low_memory=False)
+                df.drop_duplicates(inplace=True)
                 if "Date" in df.columns:
                     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-                df.drop_duplicates(inplace=True)
+                num_cols = df.select_dtypes(include=["number"]).columns
+                for c in num_cols:
+                    if df[c].isna().any():
+                        _m = df[c].median()
+                        df[c] = df[c].fillna(0 if pd.isna(_m) else _m)
+                for c in df.select_dtypes(include=["object", "string"]).columns:
+                    df[c] = df[c].fillna("")
+                df.dropna(how="all", inplace=True)
                 df.to_csv(cleaned_path, index=False)
                 sandbox_result["fallback"] = "pandas guaranteed fallback used"
             except Exception as fb_err:
@@ -550,7 +584,9 @@ async def approve_pipeline(body: ApproveRequest):
         else:
             if not os.path.isfile(cleaned_path):
                 try:
-                    pd.read_csv(csv_path).head(200).drop_duplicates().to_csv(cleaned_path, index=False)
+                    _fb = pd.read_csv(csv_path, low_memory=False)
+                    _fb.drop_duplicates(inplace=True)
+                    _fb.to_csv(cleaned_path, index=False)
                 except Exception:
                     pass
 
