@@ -1,35 +1,47 @@
 "use client";
 
 import React, { useCallback, useState } from "react";
-import { Upload, Loader2 } from "lucide-react";
+import { Upload, FileSpreadsheet } from "lucide-react";
 import { usePipeline } from "@/components/PipelineProvider";
 
 export default function DatasetUpload() {
-  const { uploadDataset, uploadBusy, csvFilename } = usePipeline();
+  const {
+    pendingDatasetFile,
+    setPendingDatasetFile,
+    inputCsvPath,
+    setInputCsvPath,
+    loading,
+  } = usePipeline();
   const [drag, setDrag] = useState(false);
 
+  const displayName =
+    pendingDatasetFile?.name ??
+    (inputCsvPath
+      ? inputCsvPath.replace(/\\/g, "/").split("/").filter(Boolean).pop()
+      : null);
+
   const onDrop = useCallback(
-    async (e: React.DragEvent) => {
+    (e: React.DragEvent) => {
       e.preventDefault();
       setDrag(false);
       const f = e.dataTransfer.files?.[0];
       if (!f) return;
-      if (!f.name.toLowerCase().endsWith(".csv")) {
-        return;
-      }
-      await uploadDataset(f);
+      if (!f.name.toLowerCase().endsWith(".csv")) return;
+      setInputCsvPath(null);
+      setPendingDatasetFile(f);
     },
-    [uploadDataset]
+    [setPendingDatasetFile, setInputCsvPath]
   );
 
   const onPick = useCallback(
-    async (e: React.ChangeEvent<HTMLInputElement>) => {
+    (e: React.ChangeEvent<HTMLInputElement>) => {
       const f = e.target.files?.[0];
       e.target.value = "";
       if (!f) return;
-      await uploadDataset(f);
+      setInputCsvPath(null);
+      setPendingDatasetFile(f);
     },
-    [uploadDataset]
+    [setPendingDatasetFile, setInputCsvPath]
   );
 
   return (
@@ -53,27 +65,29 @@ export default function DatasetUpload() {
         accept=".csv,text/csv"
         className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
         onChange={onPick}
-        disabled={uploadBusy}
+        disabled={loading}
       />
       <div className="pointer-events-none flex flex-col items-center gap-2">
-        {uploadBusy ? (
-          <Loader2 className="text-cyan-400 animate-spin" size={28} />
+        {displayName ? (
+          <FileSpreadsheet className="text-cyan-400/90" size={28} />
         ) : (
           <Upload className="text-gray-500" size={28} />
         )}
         <p className="text-sm font-medium text-gray-300">
-          Drop a CSV here or click to upload
+          Drop a CSV here or click to select
         </p>
-        <p className="text-[11px] text-gray-500 max-w-sm">
-          Files are stored under <code className="text-gray-400">backend/data/</code>.
-          {csvFilename ? (
-            <span className="block mt-1 text-cyan-400/90">
-              Active: {csvFilename}
-            </span>
-          ) : (
-            <span className="block mt-1">No file selected yet.</span>
-          )}
+        <p className="text-[11px] text-gray-500 max-w-md">
+          The file is uploaded when you click{" "}
+          <span className="text-gray-400">Start pipeline</span> (saved under{" "}
+          <code className="text-gray-400">backend/temp_data/</code>).
         </p>
+        {displayName ? (
+          <p className="text-[12px] text-cyan-400/90 mt-1 font-medium">
+            Selected: {displayName}
+          </p>
+        ) : (
+          <p className="text-[11px] text-gray-600 mt-1">No file selected yet.</p>
+        )}
       </div>
     </div>
   );

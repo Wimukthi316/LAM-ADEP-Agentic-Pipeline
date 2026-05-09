@@ -58,15 +58,17 @@ _MAX_METADATA_BYTES = 6000
 
 
 def _derive_cleaned_path(csv_path: str) -> str:
-    """Derive the output cleaned CSV path from the input CSV path.
+    """Derive cleaned CSV next to the source file (same directory as INPUT).
 
     Examples:
-      .../data/supermarket_sales.csv  →  .../data/cleaned_supermarket_sales.csv
-      .../data/retail_data.csv        →  .../data/cleaned_retail_data.csv
+      .../data/sales.csv           →  .../data/cleaned_sales.csv
+      .../temp_data/upload.csv     →  .../temp_data/cleaned_upload.csv
     """
-    basename = os.path.basename(csv_path)
+    abs_csv = os.path.abspath(csv_path)
+    parent = os.path.dirname(abs_csv)
+    basename = os.path.basename(abs_csv)
     name, ext = os.path.splitext(basename)
-    return os.path.join(_DATA_DIR, f"cleaned_{name}{ext}")
+    return os.path.join(parent, f"cleaned_{name}{ext}")
 
 
 # ---------------------------------------------------------------------------

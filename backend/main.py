@@ -97,29 +97,21 @@ def run_code_in_sandbox(code: str, csv_path: str, cleaned_path: str, timeout: in
 # ── Analytics ────────────────────────────────────────────────────────────────
 
 
-def _first_raw_csv_in_data_dir() -> str | None:
-    try:
-        for name in sorted(os.listdir(_DATA_DIR)):
-            if not name.lower().endswith(".csv"):
-                continue
-            if name.lower().startswith("cleaned_"):
-                continue
-            path = os.path.join(_DATA_DIR, name)
-            if os.path.isfile(path):
-                return path
-    except OSError:
-        pass
-    return None
-
-
 def resolve_analytics_csv(csv_filename: str | None) -> str | None:
     """Pick a dataset path for /analytics (never assumes a fixed filename)."""
     if csv_filename:
-        path = os.path.join(_DATA_DIR, csv_filename)
-        return path if os.path.isfile(path) else None
+        safe = os.path.basename(csv_filename)
+        for base in (_TEMP_DATA_DIR, _DATA_DIR):
+            path = os.path.join(base, safe)
+            if os.path.isfile(path):
+                return path
+        resolved = _resolve_csv_within_allowed(csv_filename)
+        if resolved:
+            return resolved
+        return None
     if _active_csv_path and os.path.isfile(_active_csv_path):
         return _active_csv_path
-    sample = _first_raw_csv_in_data_dir()
+    sample = _first_raw_csv_scan_dirs()
     if sample:
         return sample
     return None
@@ -272,11 +264,14 @@ async def _global_err(request: Request, exc: Exception):
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
 class StartRequest(BaseModel):
-    input_data:   str = Field(default="sample_data")
+    input_data:      str = Field(default="sample_data")
+    input_csv_path:  Optional[str] = Field(
+        default=None,
+        description="Absolute path returned by POST /upload (under backend/temp_data/).",
+    )
     csv_filename: Optional[str] = Field(
         default=None,
-        description="Filename of an already-uploaded CSV under backend/data/. "
-                    "Leave empty to use the default supermarket_sales.csv.",
+        description="Legacy: basename of a CSV under backend/data/ or temp_data/.",
     )
 
 class ApproveRequest(BaseModel):
@@ -306,6 +301,56 @@ def _cfg(thread_id: str) -> dict:
 
 _latest_status: dict[str, Any] = {}
 _active_csv_path: str | None = CSV_PATH if os.path.isfile(CSV_PATH) else None
+
+# Uploaded CSVs land here; paths are validated before use by LangGraph / sandbox.
+_TEMP_DATA_DIR = os.path.join(_BACKEND_DIR, "temp_data")
+
+
+def _allowed_csv_roots() -> tuple[str, str]:
+    return (
+        os.path.realpath(_DATA_DIR),
+        os.path.realpath(_TEMP_DATA_DIR),
+    )
+
+
+def _resolve_csv_within_allowed(raw: str) -> str | None:
+    """Resolve *raw* to a real CSV path only if it lies under data/ or temp_data/."""
+    if not raw or not str(raw).strip():
+        return None
+    try:
+        candidate = os.path.realpath(os.path.abspath(str(raw).strip()))
+    except OSError:
+        return None
+    if not os.path.isfile(candidate):
+        return None
+    if not candidate.lower().endswith(".csv"):
+        return None
+    for root in _allowed_csv_roots():
+        try:
+            if os.path.commonpath([candidate, root]) == root:
+                return candidate
+        except ValueError:
+            continue
+    return None
+
+
+def _first_raw_csv_scan_dirs() -> str | None:
+    """First non-cleaned .csv under temp_data/, then data/."""
+    for directory in (_TEMP_DATA_DIR, _DATA_DIR):
+        try:
+            if not os.path.isdir(directory):
+                continue
+            for name in sorted(os.listdir(directory)):
+                if not name.lower().endswith(".csv"):
+                    continue
+                if name.lower().startswith("cleaned_"):
+                    continue
+                path = os.path.join(directory, name)
+                if os.path.isfile(path):
+                    return path
+        except OSError:
+            continue
+    return None
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -342,11 +387,7 @@ async def get_thread_state(thread_id: str):
 
 @app.post("/upload", tags=["Data"])
 async def upload_dataset(file: UploadFile = File(...)):
-    """Upload a CSV dataset. Saves to backend/data/<filename>.
-
-    The returned `csv_filename` should be passed to POST /start as
-    `csv_filename` so the pipeline processes the uploaded file.
-    """
+    """Upload a CSV dataset. Saves securely under backend/temp_data/."""
     global _active_csv_path
 
     if not file.filename or not file.filename.lower().endswith(".csv"):
@@ -355,28 +396,33 @@ async def upload_dataset(file: UploadFile = File(...)):
         })
 
     safe_name = os.path.basename(file.filename)   # strip any path traversal
-    dest_path = os.path.join(_DATA_DIR, safe_name)
+    dest_path = os.path.abspath(os.path.join(_TEMP_DATA_DIR, safe_name))
 
     try:
         contents = await file.read()
         if len(contents) > 50 * 1024 * 1024:   # 50 MB limit
             return _safe_json({"success": False, "error": "File exceeds 50 MB limit."})
 
-        os.makedirs(_DATA_DIR, exist_ok=True)
+        os.makedirs(_TEMP_DATA_DIR, exist_ok=True)
         with open(dest_path, "wb") as f:
             f.write(contents)
 
-        # Quick validation — make sure it's a readable CSV
-        df_check = pd.read_csv(dest_path, nrows=5)
-        _active_csv_path = dest_path
+        resolved = _resolve_csv_within_allowed(dest_path)
+        if not resolved:
+            return _safe_json({"success": False, "error": "Upload path validation failed."})
+
+        # Quick validation — readable CSV header/sniff
+        df_check = pd.read_csv(resolved, nrows=5)
+        _active_csv_path = resolved
 
         logger.info("[Upload] Saved %s (%d bytes, %d cols)", safe_name, len(contents), len(df_check.columns))
         return _safe_json({
             "success":      True,
+            "file_path":    resolved,
             "csv_filename": safe_name,
-            "path":         dest_path,
+            "path":         resolved,
             "columns":      list(df_check.columns),
-            "message":      f"'{safe_name}' uploaded successfully. Pass csv_filename to /start.",
+            "message":      f"'{safe_name}' uploaded to temp_data. Pass file_path to POST /start as input_csv_path.",
         })
 
     except Exception as exc:
@@ -386,13 +432,16 @@ async def upload_dataset(file: UploadFile = File(...)):
 
 @app.get("/download", tags=["Pipeline"])
 async def download_cleaned(csv_filename: Optional[str] = None):
+    path = None
     if csv_filename:
         stem = os.path.splitext(os.path.basename(csv_filename))[0]
-        path = os.path.join(_DATA_DIR, f"cleaned_{stem}.csv")
+        for base in (_TEMP_DATA_DIR, _DATA_DIR):
+            cand = os.path.join(base, f"cleaned_{stem}.csv")
+            if os.path.isfile(cand):
+                path = cand
+                break
     elif _active_csv_path:
         path = _derive_cleaned_path(_active_csv_path)
-    else:
-        path = None
 
     if not path or not os.path.isfile(path):
         return _safe_json({"success": False, "error": "FILE_NOT_FOUND",
@@ -467,33 +516,46 @@ async def get_memory():
 
 @app.post("/start", response_model=APIResponse, tags=["Pipeline"])
 async def start_pipeline(body: StartRequest):
-    """Start the pipeline. If csv_filename is provided, uses that dataset."""
+    """Start LangGraph. Prefer input_csv_path from POST /upload."""
     global _active_csv_path
 
     thread_id = str(uuid.uuid4())
     config    = _cfg(thread_id)
 
-    # Resolve CSV path: explicit upload selection > last active > any CSV in data/
-    if body.csv_filename:
-        safe = os.path.basename(body.csv_filename)
-        csv_path = os.path.join(_DATA_DIR, safe)
-        if not os.path.isfile(csv_path):
+    csv_path: str | None = None
+
+    if body.input_csv_path:
+        csv_path = _resolve_csv_within_allowed(body.input_csv_path)
+        if not csv_path:
             return APIResponse(
                 success=False, thread_id=thread_id,
-                message=f"'{safe}' not found in data/. Upload via POST /upload first.",
+                message="Invalid input_csv_path. Upload via POST /upload and pass the returned file_path.",
+            )
+        _active_csv_path = csv_path
+    elif body.csv_filename:
+        safe = os.path.basename(body.csv_filename)
+        for base in (_TEMP_DATA_DIR, _DATA_DIR):
+            cand = os.path.join(base, safe)
+            if os.path.isfile(cand):
+                csv_path = cand
+                break
+        if not csv_path:
+            return APIResponse(
+                success=False, thread_id=thread_id,
+                message=f"'{safe}' not found under temp_data/ or data/. Upload via POST /upload first.",
             )
         _active_csv_path = csv_path
     elif _active_csv_path and os.path.isfile(_active_csv_path):
         csv_path = _active_csv_path
     else:
-        fallback = _first_raw_csv_in_data_dir()
+        fallback = _first_raw_csv_scan_dirs()
         if fallback:
             csv_path = fallback
             _active_csv_path = fallback
         else:
             return APIResponse(
                 success=False, thread_id=thread_id,
-                message="No dataset available. Upload a CSV via POST /upload and pass csv_filename on /start.",
+                message="No dataset available. Upload a CSV via POST /upload, then call /start with input_csv_path.",
             )
 
     logger.info(

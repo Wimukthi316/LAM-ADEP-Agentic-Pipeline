@@ -6,6 +6,7 @@
 .env.production.local
 
 # Python / Backend
+backend/temp_data/
 __pycache__/
 *.py[cod]
 *$py.class

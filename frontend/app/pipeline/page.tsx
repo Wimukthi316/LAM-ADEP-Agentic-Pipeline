@@ -23,6 +23,9 @@ export default function PipelinePage() {
   const {
     pipeline,
     loading,
+    startPhase,
+    pendingDatasetFile,
+    inputCsvPath,
     startPipeline,
     reset,
   } = usePipeline();
@@ -34,14 +37,17 @@ export default function PipelinePage() {
   const isRunning = pipeline.status === "running";
   const isCompleted = pipeline.status === "completed";
   const isFailed = pipeline.status === "failed";
+  const canStart = Boolean(pendingDatasetFile || inputCsvPath);
 
   return (
     <main className="p-6 max-w-[1600px] mx-auto w-full flex flex-col gap-8">
       <section>
         <h2 className="text-lg font-semibold text-white">Dataset</h2>
         <p className="text-[11px] text-gray-500 mt-1 mb-4">
-          Upload a CSV, then start the LangGraph run. The backend resolves paths
-          dynamically—no hardcoded supermarket file.
+          Select a CSV, then click Start — the client POSTs to{" "}
+          <code className="text-gray-400">/upload</code> then{" "}
+          <code className="text-gray-400">/start</code> with{" "}
+          <code className="text-gray-400">input_csv_path</code>.
         </p>
         <DatasetUpload />
       </section>
@@ -63,12 +69,14 @@ export default function PipelinePage() {
         <button
           type="button"
           onClick={() => void startPipeline()}
-          disabled={loading || isRunning || isPaused || isCompleted}
+          disabled={
+            loading || !canStart || isRunning || isPaused || isCompleted
+          }
           className={`
                 w-full max-w-md py-3 rounded-xl font-semibold text-sm
                 flex items-center justify-center gap-2 transition-all duration-200
                 ${
-                  loading || isRunning || isPaused || isCompleted
+                  loading || !canStart || isRunning || isPaused || isCompleted
                     ? "bg-[#1c2333] text-gray-500 cursor-not-allowed"
                     : "bg-gradient-to-r from-cyan-500 to-blue-600 text-white hover:from-cyan-400 hover:to-blue-500 hover:shadow-lg hover:shadow-cyan-500/20 active:scale-[0.98]"
                 }
@@ -77,7 +85,11 @@ export default function PipelinePage() {
           {loading ? (
             <>
               <Loader2 size={16} className="animate-spin" />
-              Initializing…
+              {startPhase === "uploading"
+                ? "Uploading CSV…"
+                : startPhase === "starting"
+                  ? "Starting pipeline…"
+                  : "Working…"}
             </>
           ) : (
             <>

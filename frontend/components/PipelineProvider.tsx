@@ -38,13 +38,18 @@ interface PipelineContextValue {
   pipeline: PipelineUIState;
   editedCode: string;
   setEditedCode: (v: string) => void;
+  /** Basename for analytics/download UI (from uploaded path or pending file). */
   csvFilename: string | null;
-  setCsvFilename: (v: string | null) => void;
+  pendingDatasetFile: File | null;
+  setPendingDatasetFile: (f: File | null) => void;
+  /** Absolute path from POST /upload (`file_path`) after last successful upload-on-start. */
+  inputCsvPath: string | null;
+  setInputCsvPath: (p: string | null) => void;
+  startPhase: "idle" | "uploading" | "starting";
   loading: boolean;
   approving: boolean;
   rejecting: boolean;
   downloading: boolean;
-  uploadBusy: boolean;
   analyticsLoading: boolean;
   analyticsError: string | null;
   analyticsSnapshot: {
@@ -59,7 +64,6 @@ interface PipelineContextValue {
   memoryLoading: boolean;
   refreshAnalytics: () => Promise<void>;
   refreshMemory: () => Promise<void>;
-  uploadDataset: (file: File) => Promise<boolean>;
   startPipeline: () => Promise<void>;
   approvePipeline: () => Promise<void>;
   rejectPipeline: (feedback: string) => Promise<void>;
@@ -162,12 +166,24 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
   const { toasts, addToast, dismissToast } = useToast();
   const [pipeline, setPipeline] = useState<PipelineUIState>(DEFAULT_PIPELINE_UI);
   const [editedCode, setEditedCode] = useState("");
-  const [csvFilename, setCsvFilename] = useState<string | null>(null);
+  const [pendingDatasetFile, setPendingDatasetFile] = useState<File | null>(null);
+  const [inputCsvPath, setInputCsvPath] = useState<string | null>(null);
+  const [startPhase, setStartPhase] = useState<"idle" | "uploading" | "starting">(
+    "idle"
+  );
   const [loading, setLoading] = useState(false);
   const [approving, setApproving] = useState(false);
   const [rejecting, setRejecting] = useState(false);
   const [downloading, setDownloading] = useState(false);
-  const [uploadBusy, setUploadBusy] = useState(false);
+
+  const csvFilename = useMemo(() => {
+    if (inputCsvPath) {
+      const norm = inputCsvPath.replace(/\\/g, "/");
+      const seg = norm.split("/").filter(Boolean);
+      return seg.length ? seg[seg.length - 1]! : null;
+    }
+    return pendingDatasetFile?.name ?? null;
+  }, [inputCsvPath, pendingDatasetFile]);
   const [analyticsLoading, setAnalyticsLoading] = useState(true);
   const [analyticsError, setAnalyticsError] = useState<string | null>(null);
   const [analyticsSnapshot, setAnalyticsSnapshot] = useState<{
@@ -318,50 +334,54 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
     }
   }, [addToast]);
 
-  const uploadDataset = useCallback(
-    async (file: File): Promise<boolean> => {
-      setUploadBusy(true);
-      try {
-        const fd = new FormData();
-        fd.append("file", file);
-        const res = await axios.post(`${API_BASE}/upload`, fd, {
-          headers: { "Content-Type": "multipart/form-data" },
-        });
-        const d = res.data as Record<string, unknown>;
-        if (d.success === false) {
-          addToast("error", "Upload", apiErrorDetail(d));
-          return false;
-        }
-        const name = d.csv_filename;
-        if (typeof name === "string") setCsvFilename(name);
-        const toastMsg =
-          typeof d.message === "string"
-            ? d.message
-            : typeof name === "string"
-              ? name
-              : "Ready.";
-        addToast("success", "Dataset uploaded", toastMsg);
-        await refreshAnalytics();
-        return true;
-      } catch (err: unknown) {
-        let msg = "Upload failed — is the API running?";
-        if (axios.isAxiosError(err) && err.response?.data)
-          msg = apiErrorDetail(err.response.data);
-        addToast("error", "Upload", msg);
-        return false;
-      } finally {
-        setUploadBusy(false);
-      }
-    },
-    [addToast, refreshAnalytics]
-  );
-
   const startPipeline = useCallback(async () => {
+    if (!pendingDatasetFile && !inputCsvPath) {
+      addToast(
+        "warning",
+        "No dataset",
+        "Choose a CSV file first, then start (upload runs automatically)."
+      );
+      return;
+    }
+
     setLoading(true);
     try {
-      const body: Record<string, unknown> = { input_data: "sample_data" };
-      if (csvFilename) body.csv_filename = csvFilename;
-      const res = await axios.post(`${API_BASE}/start`, body);
+      let path = inputCsvPath;
+
+      if (pendingDatasetFile) {
+        setStartPhase("uploading");
+        const fd = new FormData();
+        fd.append("file", pendingDatasetFile);
+        const up = await axios.post(`${API_BASE}/upload`, fd, {
+          headers: { "Content-Type": "multipart/form-data" },
+        });
+        const ud = up.data as Record<string, unknown>;
+        if (ud.success === false) {
+          addToast("error", "Upload failed", apiErrorDetail(ud));
+          setPipeline((p) => ({ ...p, status: "failed", message: apiErrorDetail(ud) }));
+          return;
+        }
+        const fp = ud.file_path ?? ud.path;
+        if (typeof fp !== "string" || !fp.trim()) {
+          addToast("error", "Upload failed", "Missing file_path in upload response.");
+          return;
+        }
+        path = fp.trim();
+        setInputCsvPath(path);
+        setPendingDatasetFile(null);
+        await refreshAnalytics();
+      }
+
+      if (!path) {
+        addToast("error", "Start Failed", "No CSV path after upload.");
+        return;
+      }
+
+      setStartPhase("starting");
+      const res = await axios.post(`${API_BASE}/start`, {
+        input_data: "sample_data",
+        input_csv_path: path,
+      });
       const data = res.data as Record<string, unknown>;
 
       if (data.success === false) {
@@ -391,9 +411,10 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
       addToast("error", "Start Failed", msg);
       setPipeline((p) => ({ ...p, status: "failed", message: msg }));
     } finally {
+      setStartPhase("idle");
       setLoading(false);
     }
-  }, [addToast, csvFilename]);
+  }, [addToast, pendingDatasetFile, inputCsvPath, refreshAnalytics]);
 
   const approvePipeline = useCallback(async () => {
     if (!pipeline.thread_id) {
@@ -482,6 +503,8 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
   const reset = useCallback(() => {
     setPipeline({ ...DEFAULT_PIPELINE_UI });
     setEditedCode("");
+    setPendingDatasetFile(null);
+    setInputCsvPath(null);
     addToast("info", "Reset", "Pipeline UI reset.");
   }, [addToast]);
 
@@ -542,12 +565,15 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
       editedCode,
       setEditedCode,
       csvFilename,
-      setCsvFilename,
+      pendingDatasetFile,
+      setPendingDatasetFile,
+      inputCsvPath,
+      setInputCsvPath,
+      startPhase,
       loading,
       approving,
       rejecting,
       downloading,
-      uploadBusy,
       analyticsLoading,
       analyticsError,
       analyticsSnapshot,
@@ -555,7 +581,6 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
       memoryLoading,
       refreshAnalytics,
       refreshMemory,
-      uploadDataset,
       startPipeline,
       approvePipeline,
       rejectPipeline,
@@ -567,11 +592,14 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
       pipeline,
       editedCode,
       csvFilename,
+      pendingDatasetFile,
+      inputCsvPath,
+      setInputCsvPath,
+      startPhase,
       loading,
       approving,
       rejecting,
       downloading,
-      uploadBusy,
       analyticsLoading,
       analyticsError,
       analyticsSnapshot,
@@ -579,7 +607,6 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
       memoryLoading,
       refreshAnalytics,
       refreshMemory,
-      uploadDataset,
       startPipeline,
       approvePipeline,
       rejectPipeline,
