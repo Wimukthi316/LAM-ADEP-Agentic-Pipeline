@@ -1,75 +1,148 @@
 """
 LAM-ADEP Agentic Data Engineering Pipeline — LangGraph Workflow
 ===============================================================
-Production MVP with REAL LLM calls and data processing.
+Metadata-First Architecture with Gemini 1.5 Flash and Sandboxed Execution.
 
 Architecture
 ------------
-- Local LLM  : Ollama → qwen2.5-coder:3b  (via ChatOllama) for Discovery and Transform
-- Vector DB  : ChromaDB ephemeral            (RLHF knowledge store)
-- Data       : pandas for CSV profiling
+- LLM         : Google Gemini 1.5 Flash (via google.generativeai)
+- Vector DB   : ChromaDB persistent           (RLHF knowledge store)
+- Metadata    : Custom lightweight pandas profiler (no ydata-profiling)
+- Sandbox     : multiprocessing exec() — handled in FastAPI /approve endpoint
 
 Nodes
 -----
-1. discovery_node    — Read CSV, profile schema, call Ollama for analysis.
-2. transform_node    — Send analysis to Ollama, get cleaning code.
+1. discovery_node    — Read CSV, build compact JSON metadata, store in state.
+2. transform_node    — Send metadata JSON to Gemini Flash, extract Python code.
    ** HITL INTERRUPT immediately AFTER this node **
-3. healing_node      — Mock self-healing pass (append comment).
+3. healing_node      — Lightweight pass: verifies code is non-empty.
 4. orchestrator_node — If approved, persist code to ChromaDB for RLHF.
+                       Code execution is handled externally by the /approve endpoint.
 
 Checkpointing is handled by MemorySaver (in-memory, thread-safe).
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 from typing import TypedDict
 
 import pandas as pd
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
-from langgraph.types import interrupt, Command
+from langgraph.types import interrupt
 
 # ---------------------------------------------------------------------------
 # Environment & Logging
 # ---------------------------------------------------------------------------
-load_dotenv()
+# Explicit dotenv load with the backend directory as base path so the key is
+# always resolved correctly regardless of the CWD when uvicorn starts.
+_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+_ENV_PATH = os.path.join(_BACKEND_DIR, ".env")
+load_dotenv(dotenv_path=_ENV_PATH, override=True)
 
 logger = logging.getLogger("lam_adep.graph")
 
 # Absolute paths — always correct regardless of CWD
-_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 _DATA_DIR    = os.path.join(_BACKEND_DIR, "data")
 CSV_PATH     = os.path.join(_DATA_DIR, "supermarket_sales.csv")
 CLEANED_PATH = os.path.join(_DATA_DIR, "cleaned_sales.csv")
 
 # ---------------------------------------------------------------------------
-# Lazy LLM Client Initialization
+# Lazy Gemini Client Initialization
 # ---------------------------------------------------------------------------
-# We initialise at call-time, not import-time, so the server boots even if
-# Ollama is temporarily down.
+_gemini_model = None
 
-_ollama_llm = None
+TRANSFORM_CODE_FALLBACK = (
+    "# Fallback: Gemini did not return valid code.\n"
+    "# Please check your GEMINI_API_KEY and retry.\n"
+    "import pandas as pd\n\n"
+    f"df = pd.read_csv(r'{CSV_PATH}').head(200)\n"
+    f"df.to_csv(r'{CLEANED_PATH}', index=False)\n"
+    "print('Fallback: raw data saved as cleaned_sales.csv')\n"
+)
 
-# Always a non-None string so frontends that expect `generated_code` never break.
-TRANSFORM_CODE_FALLBACK = "# Fallback: Error generating code"
+
+def _get_gemini():
+    """Lazy-init the Gemini 1.5 Flash generative model.
+
+    Reads GEMINI_API_KEY from the environment (already loaded by load_dotenv
+    above).  Raises RuntimeError with a clear message if the key is missing.
+    """
+    global _gemini_model
+    if _gemini_model is None:
+        import google.generativeai as genai  # type: ignore
+
+        api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError(
+                "GEMINI_API_KEY is not set. "
+                f"Add it to {_ENV_PATH} and restart the server."
+            )
+        genai.configure(api_key=api_key)
+        _gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+        logger.info("Gemini 1.5 Flash client initialised.")
+    return _gemini_model
 
 
-def _get_ollama():
-    """Lazy-init the local Ollama client (qwen2.5-coder:3b)."""
-    global _ollama_llm
-    if _ollama_llm is None:
-        from langchain_ollama import ChatOllama
-        _ollama_llm = ChatOllama(
-            model="qwen2.5-coder:3b",
-            temperature=0.3,
-            timeout=120,          # generous timeout for local inference
-        )
-        logger.info("Ollama client initialised (qwen2.5-coder:3b)")
-    return _ollama_llm
+# ---------------------------------------------------------------------------
+# Lightweight Pandas Metadata Extractor
+# ---------------------------------------------------------------------------
+
+def _build_metadata_json(df: pd.DataFrame) -> str:
+    """Return a compact JSON string describing the DataFrame schema.
+
+    Fields per column:
+      - dtype      : pandas dtype string
+      - null_count : number of missing values
+      - null_pct   : percentage missing (2 d.p.)
+      - unique     : number of unique values
+      - sample     : first 3 non-null values as strings
+
+    For numeric columns, also adds:
+      - min / max / mean / std  (all rounded to 4 d.p.)
+
+    The total output is intentionally small (<4 KB for a typical 200-row CSV)
+    so it fits comfortably within Gemini's context window without wasting tokens.
+    """
+    n_rows, n_cols = df.shape
+    columns_meta: list[dict] = []
+
+    for col in df.columns:
+        series = df[col]
+        null_count = int(series.isna().sum())
+        unique_count = int(series.nunique(dropna=True))
+        sample = [str(v) for v in series.dropna().head(3).tolist()]
+
+        col_info: dict = {
+            "name":       col,
+            "dtype":      str(series.dtype),
+            "null_count": null_count,
+            "null_pct":   round(null_count / n_rows * 100, 2) if n_rows else 0,
+            "unique":     unique_count,
+            "sample":     sample,
+        }
+
+        # Numeric summary
+        if pd.api.types.is_numeric_dtype(series):
+            col_info["min"]  = round(float(series.min(skipna=True)), 4) if not series.dropna().empty else None
+            col_info["max"]  = round(float(series.max(skipna=True)), 4) if not series.dropna().empty else None
+            col_info["mean"] = round(float(series.mean(skipna=True)), 4) if not series.dropna().empty else None
+            col_info["std"]  = round(float(series.std(skipna=True)), 4) if not series.dropna().empty else None
+
+        columns_meta.append(col_info)
+
+    metadata = {
+        "file": os.path.basename(CSV_PATH),
+        "rows": n_rows,
+        "cols": n_cols,
+        "columns": columns_meta,
+    }
+    return json.dumps(metadata, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -79,143 +152,123 @@ def _get_ollama():
 class PipelineState(TypedDict):
     """Typed dictionary that travels through every node."""
 
-    input_data: str        # Schema analysis from Discovery (LLM output)
-    status: str            # Human-readable status tag
-    generated_code: str    # Cleaning code from Transform (LLM output)
-    human_feedback: str    # Feedback received at the HITL gate
+    input_data:     str   # Compact JSON metadata from Discovery
+    status:         str   # Human-readable status tag
+    generated_code: str   # Cleaning code from Transform (LLM output)
+    edited_code:    str   # User-edited version of the code (from Monaco HITL)
+    human_feedback: str   # Feedback received at the HITL gate
 
 
 # ---------------------------------------------------------------------------
-# Node 1 — Discovery Agent (Component 1)
+# Node 1 — Discovery Agent
 # ---------------------------------------------------------------------------
 
 def discovery_node(state: PipelineState) -> PipelineState:
-    """Read the first 200 rows of the CSV, profile the schema, and send it
-    to the local Ollama model for analysis and cleaning suggestions."""
-    logger.info("[Discovery] Reading CSV and profiling schema …")
+    """Read the CSV, build a compact JSON metadata document, and store it.
 
+    Does NOT call any LLM — keeps tokens for the Transform node only.
+    Falls back gracefully if the CSV cannot be read.
+    """
+    logger.info("[Discovery] Reading CSV and building metadata …")
+
+    metadata_json = ""
     try:
-        # ── 1. Load and profile data ──────────────────────────────────
-        df = pd.read_csv(CSV_PATH)
-        df = df.head(200)
-
-        # Build a markdown profile string
-        schema_lines = []
-        schema_lines.append("## Dataset Schema (first 200 rows)\n")
-        schema_lines.append(f"**Shape:** {df.shape[0]} rows × {df.shape[1]} columns\n")
-        schema_lines.append("### Columns & Data Types\n")
-        schema_lines.append("| Column | Dtype | Non-Null Count | Sample Values |")
-        schema_lines.append("|--------|-------|----------------|---------------|")
-
-        for col in df.columns:
-            non_null = df[col].notna().sum()
-            samples = ", ".join(str(v) for v in df[col].head(3).tolist())
-            schema_lines.append(
-                f"| {col} | {df[col].dtype} | {non_null}/{len(df)} | {samples} |"
-            )
-
-        schema_lines.append("\n### First 3 Rows (Markdown Table)\n")
-        schema_lines.append(df.head(3).to_markdown(index=False))
-
-        schema_str = "\n".join(schema_lines)
-        logger.info("[Discovery] Schema profile built (%d chars)", len(schema_str))
-
-        # ── 2. Call Local Ollama LLM ──────────────────────────────────
-        prompt = (
-            "You are a Data Profiler. Analyze this Supermarket Sales dataset schema. "
-            "Identify data types and suggest exactly 3 data cleaning steps "
-            "(e.g., handling nulls, formatting dates, fixing types).\n\n"
-            f"{schema_str}"
+        df = pd.read_csv(CSV_PATH).head(200)
+        metadata_json = _build_metadata_json(df)
+        logger.info(
+            "[Discovery] Metadata JSON built (%d chars, %d columns)",
+            len(metadata_json), len(df.columns),
         )
-
-        llm = _get_ollama()
-        response = llm.invoke([HumanMessage(content=prompt)])
-        analysis = response.content
-        logger.info("[Discovery] Ollama analysis received (%d chars)", len(analysis))
-
     except Exception as exc:
-        # Graceful degradation — never crash the graph
-        logger.error("[Discovery] LLM/data error: %s", exc, exc_info=True)
-        analysis = (
-            f"[Discovery Agent Error] Could not complete analysis: {exc}\n"
-            "Falling back to raw schema summary.\n\n"
-            + (schema_str if "schema_str" in dir() else "Schema unavailable.")
-        )
+        logger.error("[Discovery] Failed to read CSV: %s", exc, exc_info=True)
+        metadata_json = json.dumps({
+            "error": str(exc),
+            "file": os.path.basename(CSV_PATH),
+            "message": "Could not read or profile the source CSV.",
+        })
 
     return {
         **state,
-        "input_data": analysis,
-        "status": "Discovery Complete",
+        "input_data":     metadata_json,
+        "status":         "Discovery Complete",
         "generated_code": "",
+        "edited_code":    "",
         "human_feedback": "",
     }
 
 
 # ---------------------------------------------------------------------------
-# Node 2 — Transform Agent (Component 2)
+# Node 2 — Transform Agent (Gemini 1.5 Flash)
 # ---------------------------------------------------------------------------
 
 def transform_node(state: PipelineState) -> PipelineState:
-    """Take the Discovery analysis and ask the local Ollama model to generate a
-    complete pandas cleaning script. Then pause for human review (HITL)."""
-    logger.info("[Transform] Generating cleaning code via Ollama …")
+    """Send the metadata JSON to Gemini 1.5 Flash and extract cleaning code.
 
-    analysis = state.get("input_data", "")
+    Uses absolute path constants so the generated script always writes to the
+    correct location regardless of where it is executed.
+    """
+    logger.info("[Transform] Generating cleaning code via Gemini 1.5 Flash …")
+
+    metadata_json = state.get("input_data", "{}")
     generated_code = TRANSFORM_CODE_FALLBACK
 
+    prompt = (
+        "You are an expert Data Engineer. Below is a JSON metadata profile of a "
+        "supermarket sales CSV dataset (first 200 rows).\n\n"
+        f"```json\n{metadata_json}\n```\n\n"
+        "Write a complete, self-contained Python script using pandas that:\n"
+        f"1. Loads the CSV from the absolute path: {CSV_PATH!r}\n"
+        "2. Takes only the first 200 rows.\n"
+        "3. Applies at least 3 data cleaning steps appropriate for this dataset "
+        "(e.g. parse date columns, coerce numeric types, drop duplicates, "
+        "handle nulls, rename columns for consistency).\n"
+        f"4. Saves the cleaned DataFrame to: {CLEANED_PATH!r}\n"
+        "5. Prints a summary of rows written.\n\n"
+        "IMPORTANT: Return ONLY raw Python code. Do NOT wrap it in markdown "
+        "fences (``` or ```python). Do not include any explanation text."
+    )
+
     try:
-        prompt = (
-            "Based on this schema analysis, write a complete Python script using pandas "
-            "to load 'backend/data/supermarket_sales.csv', take the first 200 rows, "
-            "apply the suggested cleaning steps, and save the output to "
-            "'backend/data/cleaned_sales.csv'. "
-            "Return ONLY the raw python code string without markdown blocks.\n\n"
-            f"Schema Analysis:\n{analysis}"
-        )
+        model = _get_gemini()
+        response = model.generate_content(prompt)
+        raw = (response.text or "").strip()
 
-        llm = _get_ollama()
-        response = llm.invoke([HumanMessage(content=prompt)])
-        raw = response.content
-        if raw is None:
-            raw = ""
-        generated_code = str(raw).strip()
+        # Strip any markdown fences the model might emit despite instructions
+        raw = re.sub(r"^```(?:python)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw)
+        raw = raw.strip()
 
-        # Strip markdown fences if the model wraps them anyway
-        if generated_code.startswith("```"):
-            lines = generated_code.split("\n")
-            lines = [l for l in lines if not l.strip().startswith("```")]
-            generated_code = "\n".join(lines).strip()
-
-        if not generated_code:
-            generated_code = TRANSFORM_CODE_FALLBACK
-
-        logger.info(
-            "[Transform] Ollama code generated (%d chars)", len(generated_code)
-        )
+        if raw:
+            generated_code = raw
+            logger.info(
+                "[Transform] Gemini code generated (%d chars)", len(generated_code)
+            )
+        else:
+            logger.warning("[Transform] Gemini returned empty response — using fallback.")
 
     except Exception as exc:
-        logger.error("[Transform] Ollama error: %s", exc, exc_info=True)
-        generated_code = TRANSFORM_CODE_FALLBACK
+        logger.error("[Transform] Gemini error: %s", exc, exc_info=True)
+        generated_code = (
+            f"# ERROR: Gemini API call failed — {exc}\n"
+            + TRANSFORM_CODE_FALLBACK
+        )
 
     updated_state = {
         **state,
-        "status": "Code Generated. Pending Approval",
+        "status":         "Code Generated. Pending Approval",
         "generated_code": generated_code,
+        "edited_code":    generated_code,  # pre-fill editor with generated code
     }
 
     # ── HITL Gate ─────────────────────────────────────────────────────
-    # The interrupt() call pauses the graph and sends a payload back to
-    # the caller.  When the caller resumes with Command(resume=...),
-    # the node re-executes and interrupt() returns the resume value.
     human_decision: str = interrupt(
         {
-            "message": "Review the generated transformation code.",
-            "generated_code": generated_code,
+            "message":         "Review the generated transformation code.",
+            "generated_code":  generated_code,
             "action_required": "Send Command(resume='Approve') or Command(resume='Reject') to continue.",
         }
     )
 
-    # After resume — record the human decision
     updated_state["human_feedback"] = human_decision
     logger.info("[Transform] Human decision received: %s", human_decision)
 
@@ -223,40 +276,40 @@ def transform_node(state: PipelineState) -> PipelineState:
 
 
 # ---------------------------------------------------------------------------
-# Node 3 — Healing Agent (Component 3) — MOCK
+# Node 3 — Healing Agent (lightweight validation pass)
 # ---------------------------------------------------------------------------
 
 def healing_node(state: PipelineState) -> PipelineState:
-    """Mock self-healing pass.
+    """Validate that a non-empty code string exists.
 
-    In the full production version this would:
-      • Execute the generated code in a sandboxed environment,
-      • Catch runtime errors and re-prompt the LLM for fixes,
-      • Validate output data quality.
-
-    For the MVP we simply append a healing-passed comment.
+    Full sandbox execution is handled by the FastAPI /approve endpoint using
+    a multiprocessing worker, so we only do a lightweight guard here.
     """
-    logger.info("[Healing] Running mock self-healing pass …")
+    logger.info("[Healing] Running validation pass …")
 
-    code = state.get("generated_code", "")
-    code_with_healing = code + "\n# Healing passed\n"
+    code = state.get("edited_code") or state.get("generated_code", "")
+    if not code.strip():
+        code = TRANSFORM_CODE_FALLBACK
+        logger.warning("[Healing] Code was empty — substituting fallback.")
 
     return {
         **state,
-        "generated_code": code_with_healing,
-        "status": "Healing Complete",
+        "generated_code": code,
+        "edited_code":    code,
+        "status":         "Healing Complete",
     }
 
 
 # ---------------------------------------------------------------------------
-# Node 4 — Orchestrator / RLHF (Component 4)
+# Node 4 — Orchestrator / RLHF
 # ---------------------------------------------------------------------------
 
 def orchestrator_node(state: PipelineState) -> PipelineState:
-    """If the human approved, persist the generated code into a local
-    ChromaDB collection to simulate RAG-based RLHF knowledge storage.
+    """Persist the approved code to ChromaDB for RLHF knowledge storage.
 
-    If rejected, record the rejection and skip persistence.
+    Code EXECUTION is intentionally NOT done here — it is handled by the
+    FastAPI /approve endpoint via the multiprocessing sandbox before this
+    node is even reached for ChromaDB writes.
     """
     feedback = state.get("human_feedback", "").strip().lower()
     logger.info("[Orchestrator] Processing with feedback: %s", feedback)
@@ -269,7 +322,7 @@ def orchestrator_node(state: PipelineState) -> PipelineState:
 
     # ── Approved → persist to ChromaDB ────────────────────────────────
     try:
-        import chromadb
+        import chromadb  # type: ignore
 
         chroma_path = os.path.join(_BACKEND_DIR, "chroma_db")
         client = chromadb.PersistentClient(path=chroma_path)
@@ -278,105 +331,35 @@ def orchestrator_node(state: PipelineState) -> PipelineState:
             metadata={"description": "Approved pipeline code for RLHF"},
         )
 
-        code = state.get("generated_code", "")
-
-        # ── Execute the generated cleaning code ───────────────────────
-        # Strategy:
-        # 1. Rewrite any path literals so they use absolute paths.
-        # 2. Run in an isolated namespace with absolute DATA_DIR injected.
-        # 3. If exec fails for ANY reason, fall back to a guaranteed
-        #    pandas script that always produces cleaned_sales.csv.
-        exec_status = "not_run"
-        try:
-            logger.info("[Orchestrator] Preparing generated code for execution…")
-
-            # Normalise common path patterns the LLM might emit
-            code_to_exec = code
-            for old, new in [
-                ("backend/data/supermarket_sales.csv", CSV_PATH),
-                ("backend/data/cleaned_sales.csv",     CLEANED_PATH),
-                ("data/supermarket_sales.csv",          CSV_PATH),
-                ("data/cleaned_sales.csv",              CLEANED_PATH),
-                ("supermarket_sales.csv",               CSV_PATH),
-                ("cleaned_sales.csv",                   CLEANED_PATH),
-            ]:
-                code_to_exec = code_to_exec.replace(old, new)
-
-            # Isolated namespace — only inject what the script legitimately needs
-            exec_globals: dict = {
-                "__builtins__": __builtins__,
-                "CSV_PATH":     CSV_PATH,
-                "CLEANED_PATH": CLEANED_PATH,
-            }
-            exec(compile(code_to_exec, "<generated_transform>", "exec"), exec_globals)  # noqa: S102
-            exec_status = "success"
-            logger.info("[Orchestrator] Code execution successful — cleaned_sales.csv written.")
-
-        except Exception as exec_err:
-            logger.error("[Orchestrator] Exec failed: %s — running guaranteed fallback.", exec_err)
-
-        # ── Guaranteed fallback ────────────────────────────────────────
-        # Even if the LLM code crashes we ALWAYS produce the output file.
-        if exec_status != "success" or not os.path.isfile(CLEANED_PATH):
-            try:
-                logger.info("[Orchestrator] Fallback: writing cleaned_sales.csv via pandas.")
-                df = pd.read_csv(CSV_PATH).head(200)
-                # Basic cleaning: parse dates, coerce numeric columns, drop full-row dupes
-                if "Date" in df.columns:
-                    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-                for col in df.select_dtypes(include=["object"]).columns:
-                    # Try coercing to numeric where sensible
-                    try_num = pd.to_numeric(df[col], errors="coerce")
-                    if try_num.notna().mean() > 0.9:  # >90% parseable → keep as numeric
-                        df[col] = try_num
-                df = df.drop_duplicates()
-                df.to_csv(CLEANED_PATH, index=False)
-                exec_status = "fallback_success"
-                logger.info("[Orchestrator] Fallback write succeeded.")
-            except Exception as fb_err:
-                exec_status = f"fallback_failed:{fb_err}"
-                logger.error("[Orchestrator] Fallback write failed: %s", fb_err)
-
+        code = state.get("edited_code") or state.get("generated_code", "")
         collection.add(
             documents=[code],
             ids=[f"pipeline_code_{hash(code) & 0xFFFFFFFF}"],
             metadatas=[{
-                "feedback":    state.get("human_feedback", ""),
-                "status":      "approved",
-                "source":      "transform_agent",
-                "exec_status": exec_status,
+                "feedback": state.get("human_feedback", ""),
+                "status":   "approved",
+                "source":   "transform_agent_gemini",
             }],
         )
 
         doc_count = collection.count()
+        csv_ready = os.path.isfile(CLEANED_PATH)
         logger.info(
-            "[Orchestrator] Knowledge saved to ChromaDB (collection=%d, exec=%s)",
-            doc_count, exec_status,
+            "[Orchestrator] Code saved to ChromaDB (docs=%d). cleaned_sales.csv ready=%s",
+            doc_count, csv_ready,
         )
 
-        csv_ready = os.path.isfile(CLEANED_PATH)
         status_msg = (
-            f"Pipeline Complete. cleaned_sales.csv {'ready' if csv_ready else 'unavailable'}. "
+            f"Pipeline Complete. cleaned_sales.csv {'ready' if csv_ready else 'pending'}. "
             f"Knowledge saved to ChromaDB ({doc_count} docs)."
         )
-        return {
-            **state,
-            "status": status_msg,
-        }
+        return {**state, "status": status_msg}
 
     except Exception as exc:
         logger.error("[Orchestrator] ChromaDB error: %s", exc, exc_info=True)
-        # Even if ChromaDB fails, still try to produce the output file
-        try:
-            if not os.path.isfile(CLEANED_PATH):
-                df = pd.read_csv(CSV_PATH).head(200)
-                df.drop_duplicates(inplace=True)
-                df.to_csv(CLEANED_PATH, index=False)
-        except Exception:
-            pass
         return {
             **state,
-            "status": f"Pipeline Complete (ChromaDB error: {exc}). CSV output attempted.",
+            "status": f"Pipeline Complete (ChromaDB error: {exc}).",
         }
 
 
@@ -387,29 +370,23 @@ def orchestrator_node(state: PipelineState) -> PipelineState:
 def build_graph() -> StateGraph:
     """Construct and compile the LAM-ADEP pipeline graph.
 
-    Returns the compiled graph (with MemorySaver checkpointer) ready for
-    `graph.invoke()` / `graph.stream()` calls.
-
-    Flow: discovery → transform (HITL) → healing → orchestrator → END
+    Flow: discovery → transform (HITL interrupt) → healing → orchestrator → END
     """
     builder = StateGraph(PipelineState)
 
-    # Register nodes
-    builder.add_node("discovery", discovery_node)
-    builder.add_node("transform", transform_node)
-    builder.add_node("healing", healing_node)
+    builder.add_node("discovery",   discovery_node)
+    builder.add_node("transform",   transform_node)
+    builder.add_node("healing",     healing_node)
     builder.add_node("orchestrator", orchestrator_node)
 
-    # Linear edge chain: discovery → transform → healing → orchestrator → END
     builder.set_entry_point("discovery")
-    builder.add_edge("discovery", "transform")
-    builder.add_edge("transform", "healing")
-    builder.add_edge("healing", "orchestrator")
+    builder.add_edge("discovery",    "transform")
+    builder.add_edge("transform",    "healing")
+    builder.add_edge("healing",      "orchestrator")
     builder.add_edge("orchestrator", END)
 
-    # Compile with in-memory checkpointer for thread persistence
     checkpointer = MemorySaver()
     compiled = builder.compile(checkpointer=checkpointer)
 
-    logger.info("Pipeline graph compiled successfully (4 nodes).")
+    logger.info("Pipeline graph compiled (4 nodes, Gemini 1.5 Flash).")
     return compiled

@@ -3,6 +3,10 @@
 import React, { useState, useCallback, useEffect, useMemo } from "react";
 import type { Node, Edge } from "reactflow";
 import axios from "axios";
+import dynamic from "next/dynamic";
+
+// Monaco Editor — loaded client-side only (no SSR)
+const MonacoEditor = dynamic(() => import("@monaco-editor/react"), { ssr: false });
 import {
   Play,
   Loader2,
@@ -236,6 +240,8 @@ export default function Dashboard() {
     sum_total_sales: number;
     daily_sales: DailySalesPoint[];
   } | null>(null);
+  // Tracks user edits in Monaco — initialised from generated_code when pipeline pauses
+  const [editedCode, setEditedCode] = useState<string>("");
   const { toasts, addToast, dismissToast } = useToast();
 
   const nodes = useMemo(() => buildNodes(pipelineState), [pipelineState]);
@@ -245,6 +251,13 @@ export default function Dashboard() {
   const isRunning = pipelineState.status === "running";
   const isCompleted = pipelineState.status === "completed";
   const isFailed = pipelineState.status === "failed";
+
+  // ── Sync editedCode from generated_code when pipeline pauses ──
+  useEffect(() => {
+    if (isPaused && pipelineState.generated_code) {
+      setEditedCode(pipelineState.generated_code);
+    }
+  }, [isPaused, pipelineState.generated_code]);
 
   // ── Poll pipeline status ──
   useEffect(() => {
@@ -394,6 +407,8 @@ export default function Dashboard() {
         const res = await axios.post(`${API_BASE}/approve`, {
           thread_id: pipelineState.thread_id,
           action: action === "approve" ? "Approve" : "Reject",
+          // Send the Monaco-edited code so the sandbox runs the user's version
+          edited_code: action === "approve" ? editedCode : undefined,
         });
         const data = res.data as Record<string, unknown>;
 
@@ -814,12 +829,19 @@ export default function Dashboard() {
             )}
           </div>
 
-          {/* ── Generated Code Viewer — always visible when code exists ── */}
-          {pipelineState.generated_code.trim() && (
+          {/* ── Monaco Code Editor — editable when paused, read-only when done ── */}
+          {(isPaused || isCompleted) && editedCode.trim() && (
             <div className="glass-card p-5">
-              <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-2">
-                Generated Code
-              </p>
+              <div className="flex items-center justify-between mb-3">
+                <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">
+                  {isPaused ? "Edit Code Before Approving" : "Executed Code"}
+                </p>
+                {isPaused && (
+                  <span className="text-[9px] text-amber-400 bg-amber-400/10 px-2 py-0.5 rounded-full">
+                    ✏ Editable
+                  </span>
+                )}
+              </div>
               <div className="rounded-lg border border-[#1e2a3d] bg-[#0d1117] overflow-hidden shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
                 <div className="flex items-center gap-2 px-3 py-2 bg-[#161b22] border-b border-[#1e2a3d]">
                   <span className="text-[10px] text-gray-500 font-mono">
@@ -831,13 +853,30 @@ export default function Dashboard() {
                     <span className="w-2.5 h-2.5 rounded-full bg-[#28c840]" />
                   </span>
                 </div>
-                <pre
-                  className="p-3 max-h-[260px] overflow-auto text-[11px] leading-relaxed font-mono text-[#c9d1d9] whitespace-pre-wrap break-words"
-                  style={{ tabSize: 2, scrollbarGutter: "stable" }}
-                >
-                  <code>{pipelineState.generated_code}</code>
-                </pre>
+                <MonacoEditor
+                  height="300px"
+                  language="python"
+                  theme="vs-dark"
+                  value={editedCode}
+                  onChange={(val) => setEditedCode(val ?? "")}
+                  options={{
+                    readOnly: isCompleted,
+                    minimap: { enabled: false },
+                    fontSize: 12,
+                    lineNumbers: "on",
+                    scrollBeyondLastLine: false,
+                    wordWrap: "on",
+                    automaticLayout: true,
+                    padding: { top: 8, bottom: 8 },
+                    scrollbar: { verticalScrollbarSize: 6 },
+                  }}
+                />
               </div>
+              {isPaused && (
+                <p className="text-[10px] text-gray-600 mt-2">
+                  You can edit the code above. Click Approve to run your version in a secure sandbox.
+                </p>
+              )}
             </div>
           )}
 

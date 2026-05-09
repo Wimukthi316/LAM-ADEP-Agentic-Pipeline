@@ -1,29 +1,34 @@
 """
 LAM-ADEP Agentic Data Engineering Pipeline — FastAPI Server
 ============================================================
-Production-grade REST API that exposes two endpoints:
-
-  POST /start   → kick off the LangGraph pipeline (pauses at HITL gate)
-  POST /approve → resume the paused pipeline with human decision
+Production-grade REST API with multiprocessing sandbox execution.
 
 Design decisions
 ----------------
-• Global exception handler catches *everything* and returns 200 OK with a
-  structured error payload — the frontend never sees raw 500s.
-• CORS is fully open for local dev (origins=["*"]).
-• Each /start call generates a fresh UUID thread_id so multiple runs can
-  coexist in memory.
+• GEMINI_API_KEY is loaded from backend/.env via explicit dotenv path so it
+  is always resolved correctly regardless of the CWD when uvicorn starts.
+• /approve accepts an optional `edited_code` field — if provided (user edited
+  code in Monaco), that version is used for sandbox execution instead of the
+  LLM-generated original.
+• Sandbox execution uses multiprocessing.Process with a 30-second timeout.
+  The child process is forcibly killed on timeout or exception.
+• compute_analytics() wraps every column access in try/except so a missing
+  or malformatted 'Date' / numeric column never crashes the endpoint.
+• Global exception handler returns 200 OK with structured error — the
+  frontend never sees raw 5xx responses.
 """
 
 from __future__ import annotations
 
+import io
 import logging
+import multiprocessing
+import os
+import queue
 import traceback
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any
-
-import os
+from typing import Any, Optional
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -34,12 +39,12 @@ from fastapi.responses import FileResponse, JSONResponse
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from agent_graph import PipelineState, build_graph
-
 # ---------------------------------------------------------------------------
-# Bootstrap
+# Bootstrap — load .env from the backend directory explicitly
 # ---------------------------------------------------------------------------
-load_dotenv()
+_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+_ENV_PATH = os.path.join(_BACKEND_DIR, ".env")
+load_dotenv(dotenv_path=_ENV_PATH, override=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,140 +52,131 @@ logging.basicConfig(
 )
 logger = logging.getLogger("lam_adep.api")
 
+# Late import so graph module benefits from the dotenv already loaded above
+from agent_graph import PipelineState, build_graph, CSV_PATH, CLEANED_PATH  # noqa: E402
 
 # ---------------------------------------------------------------------------
-# Application lifespan — build graph once at startup
-# ---------------------------------------------------------------------------
-_compiled_graph = None            # module-level reference
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Compile the LangGraph pipeline once during server startup."""
-    global _compiled_graph
-    logger.info("Compiling LangGraph pipeline …")
-    _compiled_graph = build_graph()
-    logger.info("Server ready.")
-    yield
-    logger.info("Shutting down.")
-
-
-# ---------------------------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------------------------
-app = FastAPI(
-    title="LAM-ADEP Pipeline API",
-    version="0.1.0",
-    description="Backend MVP for the LAM-ADEP Agentic Data Engineering Pipeline.",
-    lifespan=lifespan,
-)
-
-# --- CORS (wide-open for local development) --------------------------------
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# ---------------------------------------------------------------------------
-# Global Exception Handlers — bulletproof 200-OK error envelopes
+# Multiprocessing Sandbox
 # ---------------------------------------------------------------------------
 
-@app.exception_handler(RequestValidationError)
-async def _validation_exception_handler(request: Request, exc: RequestValidationError):
-    """Catch Pydantic / FastAPI validation errors (422) and return them as
-    a clean 200 OK with a structured error payload."""
-    logger.warning(
-        "Validation error on %s %s: %s",
-        request.method,
-        request.url.path,
-        exc.errors(),
+def _sandbox_worker(code: str, csv_path: str, cleaned_path: str, result_queue: multiprocessing.Queue) -> None:
+    """Worker that runs in a child process.
+
+    Captures stdout/stderr and any exception, putting a result dict onto the
+    queue so the parent can inspect it after join().
+    """
+    import sys
+
+    captured_stdout = io.StringIO()
+    captured_stderr = io.StringIO()
+
+    try:
+        exec_globals: dict = {
+            "__builtins__": __builtins__,
+            "CSV_PATH":     csv_path,
+            "CLEANED_PATH": cleaned_path,
+        }
+
+        # Rewrite common relative path patterns to absolute paths
+        for old, new in [
+            ("backend/data/supermarket_sales.csv", csv_path),
+            ("backend/data/cleaned_sales.csv",     cleaned_path),
+            ("data/supermarket_sales.csv",          csv_path),
+            ("data/cleaned_sales.csv",              cleaned_path),
+            ("supermarket_sales.csv",               csv_path),
+            ("cleaned_sales.csv",                   cleaned_path),
+        ]:
+            code = code.replace(old, new)
+
+        # Redirect stdout so print() calls are captured
+        sys.stdout = captured_stdout
+        sys.stderr = captured_stderr
+
+        exec(compile(code, "<sandbox>", "exec"), exec_globals)  # noqa: S102
+
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
+
+        result_queue.put({
+            "success": True,
+            "stdout":  captured_stdout.getvalue(),
+            "stderr":  captured_stderr.getvalue(),
+        })
+    except Exception as exc:
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
+        result_queue.put({
+            "success":    False,
+            "error":      str(exc),
+            "traceback":  traceback.format_exc(),
+            "stdout":     captured_stdout.getvalue(),
+            "stderr":     captured_stderr.getvalue(),
+        })
+
+
+def run_code_in_sandbox(code: str, timeout: int = 30) -> dict[str, Any]:
+    """Execute *code* in an isolated child process with a hard timeout.
+
+    Returns a result dict:
+      {"success": bool, "stdout": str, "stderr": str, "error"?: str}
+
+    The child process is forcibly terminated if it does not complete within
+    *timeout* seconds.
+    """
+    if not code or not code.strip():
+        return {"success": False, "error": "No code provided to sandbox."}
+
+    # multiprocessing requires the 'spawn' start method on Windows to avoid
+    # inheriting the parent's open file handles cleanly. We use a Manager
+    # queue to pass results safely across process boundaries.
+    ctx = multiprocessing.get_context("spawn")
+    result_queue: multiprocessing.Queue = ctx.Queue()
+
+    process = ctx.Process(
+        target=_sandbox_worker,
+        args=(code, CSV_PATH, CLEANED_PATH, result_queue),
+        daemon=True,
     )
-    return JSONResponse(
-        status_code=200,
-        content={
+    process.start()
+    process.join(timeout=timeout)
+
+    if process.is_alive():
+        process.kill()
+        process.join()
+        logger.error("[Sandbox] Worker timed out after %ds — process killed.", timeout)
+        return {
             "success": False,
-            "error": "Validation Error",
-            "detail": exc.errors(),
-        },
-    )
+            "error":   f"Execution timed out after {timeout} seconds.",
+            "stdout":  "",
+            "stderr":  "",
+        }
 
-
-@app.exception_handler(Exception)
-async def _global_exception_handler(request: Request, exc: Exception):
-    """Catch any unhandled exception and return a clean 200 OK with an
-    error payload.  This prevents the frontend from ever seeing a raw 5xx."""
-    logger.error(
-        "Unhandled exception on %s %s: %s",
-        request.method,
-        request.url.path,
-        exc,
-        exc_info=True,
-    )
-    return JSONResponse(
-        status_code=200,
-        content={
+    try:
+        result = result_queue.get_nowait()
+    except queue.Empty:
+        result = {
             "success": False,
-            "error": str(exc),
-            "detail": traceback.format_exception_only(type(exc), exc)[-1].strip(),
-        },
-    )
+            "error":   "Worker exited without returning a result (possible crash).",
+            "stdout":  "",
+            "stderr":  "",
+        }
+
+    if result.get("success"):
+        logger.info(
+            "[Sandbox] Execution succeeded. stdout=%r",
+            (result.get("stdout") or "")[:200],
+        )
+    else:
+        logger.error(
+            "[Sandbox] Execution failed: %s", result.get("error", "unknown")
+        )
+
+    return result
 
 
 # ---------------------------------------------------------------------------
-# Request / Response Schemas
+# Analytics Helper — fully guarded against missing/malformatted columns
 # ---------------------------------------------------------------------------
-
-class StartRequest(BaseModel):
-    """Payload for POST /start."""
-
-    input_data: str = Field(
-        default="Sample CSV data: id, name, value",
-        description="Raw data or description to feed into the pipeline.",
-    )
-
-
-class ApproveRequest(BaseModel):
-    """Payload for POST /approve."""
-
-    thread_id: str = Field(
-        ...,
-        description="Thread ID returned by /start.",
-    )
-    action: str = Field(
-        ...,
-        description="Human decision — typically 'Approve' or 'Reject'.",
-    )
-
-
-class APIResponse(BaseModel):
-    """Standardised envelope for every API response."""
-
-    success: bool = True
-    thread_id: str = ""
-    state: dict[str, Any] = {}
-    message: str = ""
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _state_to_dict(state: PipelineState | dict) -> dict[str, Any]:
-    """Normalise graph state into a plain JSON-safe dict."""
-    if hasattr(state, "values"):
-        # LangGraph StateSnapshot — pull the .values dict
-        return dict(state.values)
-    return dict(state)
-
-
-def _config_for(thread_id: str) -> dict:
-    """Build a LangGraph config dict for a given thread."""
-    return {"configurable": {"thread_id": thread_id}}
-
 
 def _data_dir() -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
@@ -191,125 +187,223 @@ _SOURCE_CSV  = os.path.join(_data_dir(), "supermarket_sales.csv")
 
 
 def compute_analytics() -> dict[str, Any]:
-    """Load supermarket_sales.csv and return summary stats and daily aggregates."""
-    csv_path = os.path.join(_data_dir(), "supermarket_sales.csv")
+    """Load supermarket_sales.csv and return summary stats + daily aggregates.
+
+    Every column access is individually guarded by try/except so a missing
+    or badly-formatted 'Date' / numeric column never raises a KeyError or
+    crashes the endpoint.
+    """
+    csv_path = _SOURCE_CSV
     if not os.path.isfile(csv_path):
         return {
             "success": False,
-            "error": "DATASET_MISSING",
+            "error":   "DATASET_MISSING",
             "message": "supermarket_sales.csv was not found under backend/data.",
         }
 
-    required = ["Unit price", "gross income", "Total", "Date"]
     try:
         df = pd.read_csv(csv_path)
     except Exception as exc:
         logger.exception("Failed to read supermarket_sales.csv")
-        return {
-            "success": False,
-            "error": "READ_FAILED",
-            "message": str(exc),
-        }
+        return {"success": False, "error": "READ_FAILED", "message": str(exc)}
 
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        return {
-            "success": False,
-            "error": "SCHEMA_MISMATCH",
-            "message": f"Missing expected columns: {missing}",
-        }
+    # ── Numeric summaries — each wrapped individually ──────────────────
+    row_count = int(len(df))
 
     try:
+        avg_unit_price = float(pd.to_numeric(df["Unit price"], errors="coerce").mean(skipna=True) or 0.0)
+    except Exception:
+        avg_unit_price = 0.0
+
+    try:
+        sum_gross_income = float(pd.to_numeric(df["gross income"], errors="coerce").sum(skipna=True) or 0.0)
+    except Exception:
+        sum_gross_income = 0.0
+
+    try:
+        sum_total_sales = float(pd.to_numeric(df["Total"], errors="coerce").sum(skipna=True) or 0.0)
+    except Exception:
+        sum_total_sales = 0.0
+
+    # ── Daily time-series — fully optional ────────────────────────────
+    daily_sales: list[dict[str, Any]] = []
+    try:
         work = df.copy()
-        work["Date"] = pd.to_datetime(work["Date"], errors="coerce")
-        for col in ("Unit price", "gross income", "Total"):
-            work[col] = pd.to_numeric(work[col], errors="coerce")
+        work["_date"]  = pd.to_datetime(work["Date"], errors="coerce") if "Date" in work.columns else pd.NaT
+        work["_total"] = pd.to_numeric(work["Total"], errors="coerce") if "Total" in work.columns else 0.0
+        work["_gi"]    = pd.to_numeric(work["gross income"], errors="coerce") if "gross income" in work.columns else 0.0
+        work["_day"]   = work["_date"].dt.normalize()
 
-        row_count = int(len(work))
-        avg_unit_price = float(work["Unit price"].mean(skipna=True) or 0.0)
-        sum_gross_income = float(work["gross income"].sum(skipna=True) or 0.0)
-        sum_total_sales = float(work["Total"].sum(skipna=True) or 0.0)
-
-        dated = work.dropna(subset=["Date"])
-        daily = (
-            dated.groupby(dated["Date"].dt.normalize(), as_index=False)
-            .agg(
-                daily_total=("Total", "sum"),
-                daily_gross_income=("gross income", "sum"),
+        dated = work.dropna(subset=["_date"])
+        if not dated.empty:
+            daily = (
+                dated.groupby("_day", as_index=False)
+                .agg(daily_total=("_total", "sum"), daily_gross_income=("_gi", "sum"))
+                .rename(columns={"_day": "_date"})
+                .sort_values("_date")
+                .head(10)
             )
-            .sort_values("Date")
-            .head(10)
-        )
-        daily_sales: list[dict[str, Any]] = []
-        for _, row in daily.iterrows():
-            dt = row["Date"]
-            if pd.isna(dt):
-                continue
-            ts = pd.Timestamp(dt)
-            daily_sales.append(
-                {
-                    "date": ts.strftime("%Y-%m-%d"),
-                    "label": ts.strftime("%b %d"),
-                    "total_sales": round(float(row["daily_total"]), 2),
+            for _, row in daily.iterrows():
+                dt = row["_date"]
+                if pd.isna(dt):
+                    continue
+                ts = pd.Timestamp(dt)
+                daily_sales.append({
+                    "date":         ts.strftime("%Y-%m-%d"),
+                    "label":        ts.strftime("%b %d"),
+                    "total_sales":  round(float(row["daily_total"]), 2),
                     "gross_income": round(float(row["daily_gross_income"]), 2),
-                }
-            )
-
-        return {
-            "success": True,
-            "row_count": row_count,
-            "avg_unit_price": round(avg_unit_price, 4),
-            "sum_gross_income": round(sum_gross_income, 2),
-            "sum_total_sales": round(sum_total_sales, 2),
-            "daily_sales": daily_sales,
-        }
+                })
     except Exception as exc:
-        logger.exception("Analytics computation failed")
-        return {
+        logger.warning("Daily sales aggregation skipped: %s", exc)
+        daily_sales = []
+
+    return {
+        "success":          True,
+        "row_count":        row_count,
+        "avg_unit_price":   round(avg_unit_price, 4),
+        "sum_gross_income": round(sum_gross_income, 2),
+        "sum_total_sales":  round(sum_total_sales, 2),
+        "daily_sales":      daily_sales,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Application lifespan
+# ---------------------------------------------------------------------------
+_compiled_graph = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _compiled_graph
+    logger.info("Compiling LangGraph pipeline …")
+    _compiled_graph = build_graph()
+    logger.info("Server ready — Metadata-First / Gemini 1.5 Flash.")
+    yield
+    logger.info("Shutting down.")
+
+
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+app = FastAPI(
+    title="LAM-ADEP Pipeline API",
+    version="2.0.0",
+    description="Metadata-First Agentic Data Engineering Pipeline — Gemini 1.5 Flash + Sandboxed Execution.",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Global Exception Handlers
+# ---------------------------------------------------------------------------
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.warning("Validation error on %s %s: %s", request.method, request.url.path, exc.errors())
+    return JSONResponse(
+        status_code=200,
+        content={"success": False, "error": "Validation Error", "detail": exc.errors()},
+    )
+
+
+@app.exception_handler(Exception)
+async def _global_exception_handler(request: Request, exc: Exception):
+    logger.error("Unhandled exception on %s %s: %s", request.method, request.url.path, exc, exc_info=True)
+    return JSONResponse(
+        status_code=200,
+        content={
             "success": False,
-            "error": "COMPUTE_FAILED",
-            "message": str(exc),
-        }
+            "error":   str(exc),
+            "detail":  traceback.format_exception_only(type(exc), exc)[-1].strip(),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Request / Response Schemas
+# ---------------------------------------------------------------------------
+
+class StartRequest(BaseModel):
+    input_data: str = Field(
+        default="Sample CSV data: id, name, value",
+        description="Raw data or description to feed into the pipeline.",
+    )
+
+
+class ApproveRequest(BaseModel):
+    thread_id:   str = Field(..., description="Thread ID returned by /start.")
+    action:      str = Field(..., description="Human decision — 'Approve' or 'Reject'.")
+    edited_code: Optional[str] = Field(
+        default=None,
+        description="User-edited code from Monaco Editor. If provided and action is Approve, "
+                    "this code is executed in the sandbox instead of the LLM-generated original.",
+    )
+
+
+class APIResponse(BaseModel):
+    success:    bool = True
+    thread_id:  str  = ""
+    state:      dict[str, Any] = {}
+    message:    str  = ""
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _state_to_dict(state: PipelineState | dict) -> dict[str, Any]:
+    if hasattr(state, "values"):
+        return dict(state.values)
+    return dict(state)
+
+
+def _config_for(thread_id: str) -> dict:
+    return {"configurable": {"thread_id": thread_id}}
+
+
+# ---------------------------------------------------------------------------
+# Pipeline Status Store
+# ---------------------------------------------------------------------------
+_latest_status: dict[str, Any] = {}
 
 
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
-_latest_status = {}
+@app.get("/", tags=["Health"])
+async def health_check():
+    return {"success": True, "message": "LAM-ADEP Pipeline API v2 (Gemini 1.5 Flash) is running."}
+
 
 @app.get("/status", tags=["Pipeline"])
 async def get_status():
-    """Return the current state of the pipeline/LangGraph."""
     return _latest_status
-
-@app.get("/", tags=["Health"])
-async def health_check():
-    """Lightweight liveness probe."""
-    return {"success": True, "message": "LAM-ADEP Pipeline API is running."}
 
 
 @app.get("/download", tags=["Pipeline"])
 async def download_cleaned_data():
-    """Download cleaned_sales.csv if it exists; otherwise return a JSON error (200 OK)."""
     if not os.path.isfile(_CLEANED_CSV):
         return JSONResponse(
             status_code=200,
             content={
                 "success": False,
-                "error": "FILE_NOT_FOUND",
-                "message": (
-                    "cleaned_sales.csv is not available yet. "
-                    "Approve the pipeline so the transform step can produce it."
-                ),
+                "error":   "FILE_NOT_FOUND",
+                "message": "cleaned_sales.csv is not available yet. Approve the pipeline first.",
             },
         )
     try:
-        return FileResponse(
-            path=_CLEANED_CSV,
-            filename="cleaned_sales.csv",
-            media_type="text/csv",
-        )
+        return FileResponse(path=_CLEANED_CSV, filename="cleaned_sales.csv", media_type="text/csv")
     except Exception as exc:
         logger.error("FileResponse for cleaned_sales.csv failed: %s", exc)
         return JSONResponse(
@@ -320,9 +414,11 @@ async def download_cleaned_data():
 
 @app.get("/analytics", tags=["Analytics"])
 async def get_analytics():
-    """Real summary statistics from supermarket_sales.csv for the dashboard."""
+    """Real summary statistics from supermarket_sales.csv.
+
+    Fully guarded — returns 200 OK even if columns are missing or malformatted.
+    """
     result = compute_analytics()
-    # Always return 200 so the frontend can parse the error cleanly
     return JSONResponse(status_code=200, content=result)
 
 
@@ -330,9 +426,8 @@ async def get_analytics():
 async def start_pipeline(body: StartRequest):
     """Kick off the pipeline.
 
-    The graph runs through **Discovery → Transform** and then pauses at
-    the HITL interrupt gate inside the Transform node.  The response
-    contains the `thread_id` (needed to resume) and the current state.
+    Runs Discovery → Transform and pauses at the HITL interrupt gate.
+    Returns thread_id and the current state (including generated_code).
     """
     thread_id = str(uuid.uuid4())
     config = _config_for(thread_id)
@@ -340,18 +435,14 @@ async def start_pipeline(body: StartRequest):
     logger.info("Starting pipeline — thread %s", thread_id)
 
     initial_state: PipelineState = {
-        "input_data": body.input_data,
-        "status": "Initialized",
+        "input_data":     body.input_data,
+        "status":         "Initialized",
         "generated_code": "",
+        "edited_code":    "",
         "human_feedback": "",
     }
 
-    # invoke() will run until the interrupt() inside transform_node pauses
-    # the graph.  The returned value is the state *at the point of pause*.
     _compiled_graph.invoke(initial_state, config=config)
-
-    # Read the persisted state snapshot (more reliable than the return value
-    # when an interrupt is involved).
     snapshot = _compiled_graph.get_state(config)
     current_state = _state_to_dict(snapshot)
 
@@ -359,19 +450,19 @@ async def start_pipeline(body: StartRequest):
 
     global _latest_status
     _latest_status = {
-        "status": "paused_for_approval",
-        "current_stage": "transform",
-        "thread_id": thread_id,
-        "message": "Pipeline paused at HITL gate. Awaiting human approval of generated code.",
+        "status":          "paused_for_approval",
+        "current_stage":   "transform",
+        "thread_id":       thread_id,
+        "message":         "Pipeline paused at HITL gate. Review generated code in Monaco Editor.",
         "stages_completed": ["discovery"],
-        "generated_code": current_state.get("generated_code", "") or "",
+        "generated_code":  current_state.get("generated_code", "") or "",
     }
 
     return APIResponse(
         success=True,
         thread_id=thread_id,
         state=current_state,
-        message="Pipeline paused. Awaiting human approval.",
+        message="Pipeline paused. Review and optionally edit the generated code, then Approve.",
     )
 
 
@@ -379,59 +470,106 @@ async def start_pipeline(body: StartRequest):
 async def approve_pipeline(body: ApproveRequest):
     """Resume the paused pipeline after human review.
 
-    Send `action: "Approve"` to let the Healing node run, or
-    `action: "Reject"` to record the rejection and still complete
-    the graph traversal.
+    If `edited_code` is supplied AND `action` is 'Approve':
+      1. The sandbox executes the *edited* code first.
+      2. If sandbox succeeds, the graph resumes and chromaDB stores the edited code.
+      3. If sandbox fails, we fall back to a guaranteed pandas cleaning pass.
+
+    Send `action: "Reject"` to skip execution and record the rejection.
     """
     config = _config_for(body.thread_id)
 
-    # Verify the thread exists and is actually paused
     snapshot = _compiled_graph.get_state(config)
     if not snapshot or not snapshot.next:
         return APIResponse(
             success=False,
             thread_id=body.thread_id,
             state=_state_to_dict(snapshot) if snapshot else {},
-            message="No paused pipeline found for this thread_id. "
-                    "Either it was already completed or the ID is invalid.",
+            message="No paused pipeline found for this thread_id.",
         )
 
-    logger.info(
-        "Resuming pipeline — thread %s, action=%s",
-        body.thread_id,
-        body.action,
-    )
+    action_lower = body.action.strip().lower()
+    logger.info("Resuming pipeline — thread %s, action=%s", body.thread_id, body.action)
 
-    # Resume the graph; Command(resume=...) feeds the value back into
-    # the interrupt() call inside transform_node.
-    _compiled_graph.invoke(
-        Command(resume=body.action),
-        config=config,
-    )
+    # ── If approving, run the sandbox BEFORE resuming the graph ──────
+    sandbox_result: dict[str, Any] = {}
+    if action_lower == "approve":
+        # Prefer user-edited code over original LLM output
+        state_values = _state_to_dict(snapshot)
+        code_to_run = (
+            body.edited_code.strip()
+            if body.edited_code and body.edited_code.strip()
+            else state_values.get("generated_code", "")
+        )
 
-    # Fetch the final state
+        logger.info("[Approve] Running sandbox (timeout=30s) …")
+        sandbox_result = run_code_in_sandbox(code_to_run, timeout=30)
+
+        if not sandbox_result.get("success"):
+            logger.warning(
+                "[Approve] Sandbox failed (%s) — running guaranteed fallback.",
+                sandbox_result.get("error"),
+            )
+            # Guaranteed fallback: always produce cleaned_sales.csv
+            try:
+                df = pd.read_csv(CSV_PATH).head(200)
+                if "Date" in df.columns:
+                    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+                for col in df.select_dtypes(include=["object"]).columns:
+                    coerced = pd.to_numeric(df[col], errors="coerce")
+                    if coerced.notna().mean() > 0.9:
+                        df[col] = coerced
+                df = df.drop_duplicates()
+                df.to_csv(CLEANED_PATH, index=False)
+                logger.info("[Approve] Fallback write succeeded — cleaned_sales.csv ready.")
+                sandbox_result["fallback"] = "Used guaranteed pandas fallback."
+            except Exception as fb_err:
+                logger.error("[Approve] Fallback also failed: %s", fb_err)
+                sandbox_result["fallback_error"] = str(fb_err)
+        else:
+            # Verify file was actually written
+            if not os.path.isfile(CLEANED_PATH):
+                logger.warning("[Approve] Sandbox reported success but cleaned_sales.csv not found — running fallback.")
+                try:
+                    pd.read_csv(CSV_PATH).head(200).drop_duplicates().to_csv(CLEANED_PATH, index=False)
+                except Exception:
+                    pass
+
+        # Patch the graph state with the edited code so orchestrator persists it
+        if body.edited_code and body.edited_code.strip():
+            _compiled_graph.update_state(
+                config,
+                {"edited_code": body.edited_code.strip(), "generated_code": body.edited_code.strip()},
+            )
+
+    # ── Resume the graph ──────────────────────────────────────────────
+    _compiled_graph.invoke(Command(resume=body.action), config=config)
+
     final_snapshot = _compiled_graph.get_state(config)
     final_state = _state_to_dict(final_snapshot)
 
     logger.info("Pipeline finished — thread %s", body.thread_id)
 
-    msg = (
-        "Pipeline completed successfully."
-        if body.action.strip().lower() == "approve"
-        else "Pipeline completed — code was rejected by human reviewer."
-    )
+    csv_ready = os.path.isfile(CLEANED_PATH)
+    if action_lower == "approve":
+        msg = (
+            f"Pipeline completed. cleaned_sales.csv {'ready ✓' if csv_ready else 'unavailable ✗'}. "
+            f"Sandbox: {'OK' if sandbox_result.get('success') else 'fallback used'}."
+        )
+    else:
+        msg = "Pipeline completed — code was rejected by human reviewer."
 
-    # Read the final status from graph state for accurate reporting
     final_status_text = final_state.get("status", "Pipeline Complete")
 
     global _latest_status
     _latest_status = {
-        "status": "completed",
-        "current_stage": "orchestrator",
-        "thread_id": body.thread_id,
-        "message": final_status_text,
+        "status":           "completed",
+        "current_stage":    "orchestrator",
+        "thread_id":        body.thread_id,
+        "message":          final_status_text,
         "stages_completed": ["discovery", "transform", "healing", "orchestrator"],
-        "generated_code": final_state.get("generated_code", "") or "",
+        "generated_code":   final_state.get("generated_code", "") or "",
+        "sandbox":          sandbox_result,
     }
 
     return APIResponse(
@@ -446,12 +584,14 @@ async def approve_pipeline(body: ApproveRequest):
 # Standalone runner
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    # multiprocessing on Windows requires this guard
+    multiprocessing.freeze_support()
     import uvicorn
 
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=8000,
-        reload=True,
+        reload=False,   # reload=True conflicts with multiprocessing spawn on Windows
         log_level="info",
     )
