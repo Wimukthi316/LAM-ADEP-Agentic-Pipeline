@@ -11,18 +11,22 @@ Architecture
 - Vector DB   : ChromaDB persistent (`approved_transforms` policy memory)
 - Sandbox     : multiprocessing exec() — handled in FastAPI /approve endpoint
 
-Graph Topology (v3 — with healing back-edge)
----------------------------------------------
-  discovery → transform ←─────────────────────┐
-                  ↓  (HITL interrupt)          │
-              healing ──(reject, iter<3)───────┘
-                  ↓  (approve OR max iters)
-            orchestrator → END
+Graph Topology (v3 — multimodal entry + healing back-edge)
+-----------------------------------------------------------
+  START ──(audio_path valid file?)──→ audio_preprocessing ──┐
+    └──────────────────────────────→ discovery ────────────┤
+                                                              ↓
+                    transform ←──────────────────────────────┘
+                          ↓  (HITL interrupt)
+                      healing ──(reject, iter<3)──→ transform
+                          ↓  (approve OR max iters)
+                    orchestrator → END
 
 Checkpointing: SQLite (`checkpoints.db`) via SqliteSaver (persistent per thread_id).
 
 Neuro-symbolic (optional): `backend/models/*.pkl` — data-quality label on discovery metadata;
 error-classifier context string built in `healing_node` for the corrective Gemini prompt in `transform_node`.
+Multimodal audio: optional `audio_path` → MFCC + `audio_classifier_model.pkl` + lazy Whisper `base` → `audio_transcript` in `input_data` JSON for Gemini.
 """
 
 from __future__ import annotations
@@ -44,11 +48,22 @@ except ImportError:  # Python < 3.11
     from typing_extensions import NotRequired  # type: ignore[misc]
 
 import joblib
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from langgraph.checkpoint.sqlite import SqliteSaver
-from langgraph.graph import END, StateGraph
+from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
+
+try:
+    import librosa
+except ImportError:  # pragma: no cover — optional until deps installed
+    librosa = None  # type: ignore[assignment,misc]
+
+try:
+    import whisper
+except ImportError:  # pragma: no cover
+    whisper = None  # type: ignore[assignment,misc]
 
 # ---------------------------------------------------------------------------
 # Environment & Logging
@@ -73,9 +88,13 @@ MAX_HEALING_ITERATIONS = 3
 _MODELS_DIR = os.path.join(_BACKEND_DIR, "models")
 _DATA_QUALITY_MODEL_PATH = os.path.join(_MODELS_DIR, "data_quality_model.pkl")
 _ERROR_CLASSIFIER_MODEL_PATH = os.path.join(_MODELS_DIR, "error_classifier_model.pkl")
+_AUDIO_CLASSIFIER_MODEL_PATH = os.path.join(_MODELS_DIR, "audio_classifier_model.pkl")
 
 data_quality_model = None
 error_classifier_model = None
+audio_classifier_model = None
+# Lazy OpenAI Whisper (`base`); set on first successful load (see `_lazy_load_whisper_model`).
+whisper_model = None  # type: ignore[assignment]
 
 try:
     if os.path.isfile(_DATA_QUALITY_MODEL_PATH):
@@ -113,6 +132,44 @@ except Exception as exc:
         exc,
         exc_info=True,
     )
+
+try:
+    if os.path.isfile(_AUDIO_CLASSIFIER_MODEL_PATH):
+        audio_classifier_model = joblib.load(_AUDIO_CLASSIFIER_MODEL_PATH)
+        logger.info(
+            "[Audio] Loaded audio_classifier_model from %s",
+            _AUDIO_CLASSIFIER_MODEL_PATH,
+        )
+    else:
+        logger.info(
+            "[Audio] audio_classifier_model.pkl not found at %s — skipping.",
+            _AUDIO_CLASSIFIER_MODEL_PATH,
+        )
+except Exception as exc:
+    audio_classifier_model = None
+    logger.warning(
+        "[Audio] Failed to load audio_classifier_model: %s",
+        exc,
+        exc_info=True,
+    )
+
+
+def _lazy_load_whisper_model():
+    """Load Whisper `base` once; failures leave `whisper_model` as None."""
+    global whisper_model
+    if whisper_model is not None:
+        return whisper_model
+    if whisper is None:
+        logger.warning("[Audio] `whisper` package not available — install openai-whisper.")
+        return None
+    try:
+        whisper_model = whisper.load_model("base")  # type: ignore[union-attr]
+        logger.info("[Audio] Whisper `base` model loaded.")
+    except Exception as exc:
+        logger.warning("[Audio] Whisper load failed: %s", exc, exc_info=True)
+        whisper_model = None
+    return whisper_model
+
 
 # ChromaDB policy memory (persistent RLHF / approved transforms)
 _CHROMA_DB_PATH = os.path.join(_BACKEND_DIR, "chroma_db")
@@ -653,6 +710,222 @@ class PipelineState(TypedDict):
     traceback:          NotRequired[str]  # Optional sandbox / exec traceback for ML routing
     # Corrective Gemini prompt fragment (built in healing_node when ML + traceback available)
     healing_llm_error_context: NotRequired[str]
+    # Multimodal audio (optional): set `audio_path` to an existing file to enter the audio branch
+    audio_path:         NotRequired[str]
+    audio_transcript: NotRequired[str]
+
+
+def _route_multimodal_entry(state: PipelineState) -> str:
+    """Entry router: valid `audio_path` → audio preprocessing; otherwise CSV discovery."""
+    raw = (state.get("audio_path") or "").strip()
+    if not raw:
+        return "discovery"
+    path = os.path.abspath(raw)
+    if os.path.isfile(path):
+        logger.info("[Router] Entry → audio_preprocessing (%s)", os.path.basename(path))
+        return "audio_preprocessing"
+    logger.warning(
+        "[Router] audio_path is not a readable file (%s) — falling back to discovery.",
+        path,
+    )
+    return "discovery"
+
+
+def _is_speech_like_audio_class(pred: str) -> bool:
+    """Heuristic match for positive speech classes (e.g. Speech/Human) vs noise/music labels."""
+    s = (pred or "").strip().lower()
+    if not s:
+        return False
+    if any(x in s for x in ("non-speech", "non_speech", "noise", "music", "ambient", "silence")):
+        return False
+    if any(x in s for x in ("speech", "human", "voice", "spoken")):
+        return True
+    if s in ("1", "true", "yes", "pos", "positive"):
+        return True
+    return False
+
+
+def _build_audio_input_data_json(
+    *,
+    audio_path: str,
+    prediction: str | None,
+    transcript: str,
+    notes: list[str],
+    error: str | None,
+) -> str:
+    """JSON for Gemini / Chroma: transcript + classifier metadata, capped to `_MAX_METADATA_BYTES`."""
+
+    def _byte_len(s: str) -> int:
+        return len(s.encode("utf-8"))
+
+    payload: dict = {
+        "modality": "audio",
+        "audio_path": os.path.basename(audio_path),
+        "audio_classifier_prediction": prediction,
+        "audio_transcript": transcript,
+        "notes": notes,
+    }
+    if error:
+        payload["error"] = error
+
+    t = transcript
+    while True:
+        payload["audio_transcript"] = t
+        raw = json.dumps(payload, indent=2)
+        if _byte_len(raw) <= _MAX_METADATA_BYTES:
+            return raw
+        if len(t) <= 64:
+            return json.dumps(
+                {
+                    "modality": "audio",
+                    "audio_path": os.path.basename(audio_path),
+                    "audio_classifier_prediction": prediction,
+                    "notes": notes,
+                    "error": error or "audio_metadata_truncated",
+                    "audio_transcript": (t[:512] + "…") if t else "",
+                },
+                separators=(",", ":"),
+            )
+        t = t[: max(64, len(t) * 3 // 4)]
+
+
+# ---------------------------------------------------------------------------
+# Node 0 — Audio preprocessing (MFCC + classifier + optional Whisper)
+# ---------------------------------------------------------------------------
+
+def audio_preprocessing_node(state: PipelineState) -> PipelineState:
+    """Load audio, extract MFCC means, classify; transcribe with Whisper when speech-like."""
+    audio_path = (state.get("audio_path") or "").strip()
+    notes: list[str] = []
+    prediction: str | None = None
+    transcript = ""
+    err: str | None = None
+    status = "Audio Preprocessing Complete"
+
+    if not audio_path:
+        err = "missing_audio_path"
+        status = "Audio preprocessing skipped (no path)."
+        meta = _build_audio_input_data_json(
+            audio_path="",
+            prediction=None,
+            transcript="",
+            notes=notes + [err],
+            error=err,
+        )
+        return {
+            **state,
+            "audio_transcript": "",
+            "input_data":         meta,
+            "status":             status,
+            "generated_code":     "",
+            "edited_code":        "",
+            "human_feedback":     "",
+            "rejection_feedback": "",
+            "healing_iterations": 0,
+            "traceback":                "",
+            "healing_llm_error_context": "",
+        }
+
+    abs_audio = os.path.abspath(audio_path)
+    if not os.path.isfile(abs_audio):
+        err = "invalid_audio_path"
+        notes.append(f"Not a file: {abs_audio}")
+        status = "Audio preprocessing failed (invalid path)."
+        meta = _build_audio_input_data_json(
+            audio_path=abs_audio,
+            prediction=None,
+            transcript="",
+            notes=notes,
+            error=err,
+        )
+        return {
+            **state,
+            "audio_transcript": "",
+            "input_data":         meta,
+            "status":             status,
+            "generated_code":     "",
+            "edited_code":        "",
+            "human_feedback":     "",
+            "rejection_feedback": "",
+            "healing_iterations": 0,
+            "traceback":                "",
+            "healing_llm_error_context": "",
+        }
+
+    try:
+        if librosa is None:
+            raise RuntimeError("librosa is not installed (required for MFCC extraction).")
+
+        y, sr = librosa.load(abs_audio, sr=22050)
+        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+        features = np.mean(mfcc, axis=1)
+        if features.shape[0] != 13:
+            notes.append(f"unexpected_mfcc_shape_{features.shape!r}")
+
+        if audio_classifier_model is not None:
+            try:
+                X = np.asarray(features, dtype=np.float64).reshape(1, -1)
+                pred_arr = audio_classifier_model.predict(X)
+                flat = np.asarray(pred_arr).reshape(-1)
+                prediction = str(flat[0]).strip() if flat.size else None
+                logger.info("[Audio] Classifier prediction: %s", prediction)
+            except Exception as clf_exc:
+                logger.warning("[Audio] Classifier predict failed: %s", clf_exc, exc_info=True)
+                notes.append(f"classifier_error: {clf_exc}")
+                prediction = None
+        else:
+            notes.append("audio_classifier_model_unavailable")
+
+        speech_like = _is_speech_like_audio_class(prediction or "")
+
+        if speech_like:
+            wm = _lazy_load_whisper_model()
+            if wm is not None:
+                try:
+                    result = wm.transcribe(abs_audio)
+                    if isinstance(result, dict):
+                        transcript = (result.get("text") or "").strip()
+                    else:
+                        transcript = str(result).strip()
+                    logger.info("[Audio] Whisper transcript length=%d", len(transcript))
+                except Exception as w_exc:
+                    logger.warning("[Audio] Whisper transcribe failed: %s", w_exc, exc_info=True)
+                    notes.append(f"whisper_error: {w_exc}")
+            else:
+                notes.append("whisper_model_unavailable")
+        else:
+            if prediction:
+                notes.append("non_speech_like_class_skipping_whisper")
+            else:
+                notes.append("no_classifier_prediction_skipping_whisper")
+
+    except Exception as exc:
+        logger.error("[Audio] Preprocessing failed: %s", exc, exc_info=True)
+        err = str(exc)
+        status = "Audio preprocessing degraded (see input_data.error)."
+        notes.append(f"preprocessing_exception: {exc}")
+
+    meta = _build_audio_input_data_json(
+        audio_path=abs_audio,
+        prediction=prediction,
+        transcript=transcript,
+        notes=notes,
+        error=err,
+    )
+
+    return {
+        **state,
+        "audio_transcript": transcript,
+        "input_data":         meta,
+        "status":             status,
+        "generated_code":     "",
+        "edited_code":        "",
+        "human_feedback":     "",
+        "rejection_feedback": "",
+        "healing_iterations": 0,
+        "traceback":                "",
+        "healing_llm_error_context": "",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -693,6 +966,7 @@ def discovery_node(state: PipelineState) -> PipelineState:
         "healing_iterations": 0,
         "traceback":                "",
         "healing_llm_error_context": "",
+        "audio_transcript":         "",
     }
 
 
@@ -713,6 +987,18 @@ def transform_node(state: PipelineState) -> PipelineState:
     rejection_feedback  = (state.get("rejection_feedback") or "").strip()
     healing_iterations  = state.get("healing_iterations", 0)
     healing_llm_error_ctx = (state.get("healing_llm_error_context") or "").strip()
+
+    audio_modality_preamble = ""
+    try:
+        _parsed = json.loads(metadata_json or "{}")
+        if isinstance(_parsed, dict) and _parsed.get("modality") == "audio":
+            audio_modality_preamble = (
+                "MULTIMODAL CONTEXT: The profile JSON describes an AUDIO input (`audio_transcript`, classifier output). "
+                "Generate `transform_data(df)` that is sensible for downstream use of that transcript/metadata "
+                "together with the usual pandas hygiene rules.\n\n"
+            )
+    except Exception:
+        pass
 
     logger.info(
         "[Transform] Generating code via Gemini (iter=%d, corrective=%s)",
@@ -744,6 +1030,7 @@ def transform_node(state: PipelineState) -> PipelineState:
         prompt = (
             "You are an expert Data Engineer Python Agent. Implement transformations using pandas/numpy "
             "according to reviewer feedback and the schema profile.\n\n"
+            f"{audio_modality_preamble}"
             f"{few_shot_block}"
             f"{critical_reject}"
             f"{healing_llm_error_ctx}"
@@ -759,6 +1046,7 @@ def transform_node(state: PipelineState) -> PipelineState:
         prompt = (
             "You are an expert Data Engineer Python Agent. Implement cleaning and transformations with pandas/numpy "
             "for the dataset described below.\n\n"
+            f"{audio_modality_preamble}"
             f"{few_shot_block}"
             f"{_GEMINI_TRANSFORM_RULES}\n\n"
             "Dataset metadata profile (JSON):\n"
@@ -1013,20 +1301,29 @@ def build_graph() -> StateGraph:
     """Compile the LAM-ADEP v3 pipeline graph.
 
     Topology:
-      discovery → transform (HITL interrupt)
-                      ↓
-                  healing ──(reject, iter ≤ MAX)──→ transform
-                      ↓    (approve OR iter > MAX)
-                orchestrator → END
+      START → audio_preprocessing | discovery → transform (HITL interrupt)
+                                                    ↓
+                        healing ──(reject, iter ≤ MAX)──→ transform
+                                ↓    (approve OR iter > MAX)
+                          orchestrator → END
     """
     builder = StateGraph(PipelineState)
 
+    builder.add_node("audio_preprocessing", audio_preprocessing_node)
     builder.add_node("discovery",    discovery_node)
     builder.add_node("transform",    transform_node)
     builder.add_node("healing",      healing_node)
     builder.add_node("orchestrator", orchestrator_node)
 
-    builder.set_entry_point("discovery")
+    builder.add_conditional_edges(
+        START,
+        _route_multimodal_entry,
+        {
+            "audio_preprocessing": "audio_preprocessing",
+            "discovery":           "discovery",
+        },
+    )
+    builder.add_edge("audio_preprocessing", "transform")
     builder.add_edge("discovery",    "transform")
     builder.add_edge("transform",    "healing")
 
@@ -1056,6 +1353,6 @@ def build_graph() -> StateGraph:
 
     compiled = builder.compile(checkpointer=checkpointer)
     logger.info(
-        "Pipeline graph compiled v3 (healing loop, ydata-profiling, dynamic CSV)."
+        "Pipeline graph compiled v3 (multimodal audio entry, healing loop, ydata-profiling, dynamic CSV)."
     )
     return compiled

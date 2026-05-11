@@ -358,6 +358,10 @@ class StartRequest(BaseModel):
         default=None,
         description="Legacy: basename of a CSV under backend/data/ or temp_data/.",
     )
+    audio_path: Optional[str] = Field(
+        default=None,
+        description="Optional absolute path to an audio file — starts the multimodal audio branch.",
+    )
 
 class ApproveRequest(BaseModel):
     thread_id:   str
@@ -670,6 +674,10 @@ async def start_pipeline(body: StartRequest):
         "rejection_feedback": "",
         "healing_iterations": 0,
     }
+    if body.audio_path and str(body.audio_path).strip():
+        initial["audio_path"] = str(body.audio_path).strip()
+
+    _audio_entry = bool(initial.get("audio_path"))
 
     _compiled_graph.invoke(initial, config=config)
     snapshot      = _compiled_graph.get_state(config)
@@ -681,7 +689,7 @@ async def start_pipeline(body: StartRequest):
         "current_stage":     "transform",
         "thread_id":         thread_id,
         "message":           "Pipeline paused at HITL gate. Review generated code.",
-        "stages_completed":  ["discovery"],
+        "stages_completed":  ["audio_preprocessing"] if _audio_entry else ["discovery"],
         "generated_code":    current_state.get("generated_code", ""),
         "active_csv":        os.path.basename(csv_path),
         "healing_iterations": 0,
