@@ -20,6 +20,9 @@ Graph Topology (v3 — with healing back-edge)
             orchestrator → END
 
 Checkpointing: SQLite (`checkpoints.db`) via SqliteSaver (persistent per thread_id).
+
+Neuro-symbolic (optional): `backend/models/*.pkl` — data-quality label on discovery metadata;
+error-classifier context string built in `healing_node` for the corrective Gemini prompt in `transform_node`.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -34,6 +38,12 @@ import time
 import uuid
 from typing import TypedDict
 
+try:
+    from typing import NotRequired
+except ImportError:  # Python < 3.11
+    from typing_extensions import NotRequired  # type: ignore[misc]
+
+import joblib
 import pandas as pd
 from dotenv import load_dotenv
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -56,6 +66,53 @@ CLEANED_PATH = os.path.join(_DATA_DIR, "cleaned_sales.csv")
 
 # Max healing loop iterations before forcing orchestrator
 MAX_HEALING_ITERATIONS = 3
+
+# ---------------------------------------------------------------------------
+# Neuro-symbolic: local sklearn/joblib models (optional — safe if missing)
+# ---------------------------------------------------------------------------
+_MODELS_DIR = os.path.join(_BACKEND_DIR, "models")
+_DATA_QUALITY_MODEL_PATH = os.path.join(_MODELS_DIR, "data_quality_model.pkl")
+_ERROR_CLASSIFIER_MODEL_PATH = os.path.join(_MODELS_DIR, "error_classifier_model.pkl")
+
+data_quality_model = None
+error_classifier_model = None
+
+try:
+    if os.path.isfile(_DATA_QUALITY_MODEL_PATH):
+        data_quality_model = joblib.load(_DATA_QUALITY_MODEL_PATH)
+        logger.info("[NeuroSymbolic] Loaded data_quality_model from %s", _DATA_QUALITY_MODEL_PATH)
+    else:
+        logger.info(
+            "[NeuroSymbolic] data_quality_model.pkl not found at %s — skipping.",
+            _DATA_QUALITY_MODEL_PATH,
+        )
+except Exception as exc:
+    data_quality_model = None
+    logger.warning(
+        "[NeuroSymbolic] Failed to load data_quality_model: %s",
+        exc,
+        exc_info=True,
+    )
+
+try:
+    if os.path.isfile(_ERROR_CLASSIFIER_MODEL_PATH):
+        error_classifier_model = joblib.load(_ERROR_CLASSIFIER_MODEL_PATH)
+        logger.info(
+            "[NeuroSymbolic] Loaded error_classifier_model from %s",
+            _ERROR_CLASSIFIER_MODEL_PATH,
+        )
+    else:
+        logger.info(
+            "[NeuroSymbolic] error_classifier_model.pkl not found at %s — skipping.",
+            _ERROR_CLASSIFIER_MODEL_PATH,
+        )
+except Exception as exc:
+    error_classifier_model = None
+    logger.warning(
+        "[NeuroSymbolic] Failed to load error_classifier_model: %s",
+        exc,
+        exc_info=True,
+    )
 
 # ChromaDB policy memory (persistent RLHF / approved transforms)
 _CHROMA_DB_PATH = os.path.join(_BACKEND_DIR, "chroma_db")
@@ -435,6 +492,150 @@ def _build_ydata_metadata_json(df: pd.DataFrame, csv_path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Neuro-symbolic helpers (data quality features + error classification)
+# ---------------------------------------------------------------------------
+
+def _per_column_quality_metrics(df: pd.DataFrame) -> dict[str, dict[str, float]]:
+    """Per-column null_pct, unique_pct, and skewness (numeric columns only; else 0)."""
+    n = int(len(df))
+    if n <= 0:
+        return {}
+    out: dict[str, dict[str, float]] = {}
+    for col in df.columns:
+        key = str(col)
+        s = df[col]
+        null_pct = float(s.isna().sum() / n * 100.0)
+        n_unique = int(s.nunique(dropna=True))
+        unique_pct = float(n_unique / n * 100.0)
+        skewness = 0.0
+        if pd.api.types.is_numeric_dtype(s):
+            clean = s.dropna()
+            if len(clean) >= 3:
+                try:
+                    sk = float(clean.skew())
+                    skewness = sk if math.isfinite(sk) else 0.0
+                except Exception:
+                    skewness = 0.0
+        out[key] = {
+            "null_pct":    round(null_pct, 4),
+            "unique_pct":  round(unique_pct, 4),
+            "skewness":    round(skewness, 4),
+        }
+    return out
+
+
+def _aggregate_dq_features_for_model(per_col: dict[str, dict[str, float]]) -> tuple[float, float, float]:
+    """Single-row vector (mean null %, mean unique %, mean skewness) for tabular DQ models."""
+    if not per_col:
+        return 0.0, 0.0, 0.0
+    nulls = [v["null_pct"] for v in per_col.values()]
+    uniqs = [v["unique_pct"] for v in per_col.values()]
+    skews = [v["skewness"] for v in per_col.values()]
+    return (
+        float(sum(nulls) / len(nulls)),
+        float(sum(uniqs) / len(uniqs)),
+        float(sum(skews) / len(skews)),
+    )
+
+
+def _predict_data_quality_label(vec3: tuple[float, float, float]) -> str | None:
+    """Predict dataset-level quality label from (null_pct, unique_pct, skewness) aggregates."""
+    if data_quality_model is None:
+        return None
+    try:
+        import numpy as np
+
+        X = np.asarray([vec3], dtype=np.float64)
+        pred = data_quality_model.predict(X)
+        raw = pred[0] if getattr(pred, "__len__", None) else pred
+        lab = str(raw).strip()
+        return lab or None
+    except Exception as exc:
+        logger.warning("[NeuroSymbolic] data_quality_model.predict failed: %s", exc, exc_info=True)
+        return None
+
+
+def _inject_neuro_symbolic_data_quality(df: pd.DataFrame, metadata_json: str) -> str:
+    """Enrich profile JSON with per-column null_pct / unique_pct / skewness and optional ML label."""
+    per_col = _per_column_quality_metrics(df)
+    try:
+        meta = json.loads(metadata_json)
+    except json.JSONDecodeError:
+        return metadata_json
+    if not isinstance(meta, dict) or meta.get("error"):
+        return metadata_json
+    cols = meta.get("columns")
+    if not isinstance(cols, list):
+        return metadata_json
+    for entry in cols:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if name is None:
+            continue
+        m = per_col.get(str(name))
+        if m:
+            entry["null_pct"] = m["null_pct"]
+            entry["unique_pct"] = m["unique_pct"]
+            entry["skewness"] = m["skewness"]
+    f1, f2, f3 = _aggregate_dq_features_for_model(per_col)
+    label = _predict_data_quality_label((f1, f2, f3))
+    if label is not None:
+        meta["predicted_data_quality_label"] = label
+    return _cap_metadata_dict_to_str(meta)
+
+
+def _extract_traceback_from_feedback(text: str) -> str:
+    """If the user pasted a Python traceback into rejection text, return that segment."""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    marker = "Traceback (most recent call last):"
+    if marker in t:
+        idx = t.index(marker)
+        return t[idx:].strip()[:16000]
+    return ""
+
+
+def _traceback_for_error_classifier(state: PipelineState, rejection_text: str) -> str:
+    """Prefer explicit state.traceback (e.g. injected by API), else parsed / raw feedback."""
+    tb = (state.get("traceback") or "").strip()
+    if tb:
+        return tb[:16000]
+    ex = _extract_traceback_from_feedback(rejection_text)
+    if ex:
+        return ex
+    return (rejection_text or "").strip()[:16000]
+
+
+def _predict_error_category_from_traceback(tb: str) -> str:
+    """Classify error from traceback or short error string (sklearn text pipeline)."""
+    if error_classifier_model is None:
+        return ""
+    text = (tb or "").strip()
+    if not text:
+        return ""
+    try:
+        pred = error_classifier_model.predict([text])
+    except Exception:
+        try:
+            import numpy as np
+
+            pred = error_classifier_model.predict(np.array([text], dtype=object))
+        except Exception as exc:
+            logger.warning("[NeuroSymbolic] error_classifier_model.predict failed: %s", exc, exc_info=True)
+            return ""
+    try:
+        import numpy as np
+
+        flat = np.asarray(pred).reshape(-1)
+        raw = flat[0] if flat.size else ""
+        return str(raw).strip()
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------------------
 # Graph State Schema
 # ---------------------------------------------------------------------------
 
@@ -449,6 +650,9 @@ class PipelineState(TypedDict):
     human_feedback:     str   # Latest HITL decision: "Approve" | "Reject: <text>"
     rejection_feedback: str   # Extracted text from the last rejection
     healing_iterations: int   # Reject loop counter (capped at MAX_HEALING_ITERATIONS)
+    traceback:          NotRequired[str]  # Optional sandbox / exec traceback for ML routing
+    # Corrective Gemini prompt fragment (built in healing_node when ML + traceback available)
+    healing_llm_error_context: NotRequired[str]
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +672,7 @@ def discovery_node(state: PipelineState) -> PipelineState:
     try:
         df = pd.read_csv(csv_path).head(200)
         metadata_json = _build_ydata_metadata_json(df, csv_path)
+        metadata_json = _inject_neuro_symbolic_data_quality(df, metadata_json)
         logger.info("[Discovery] Metadata JSON ready (%d chars)", len(metadata_json))
     except Exception as exc:
         logger.error("[Discovery] Failed to read/profile CSV: %s", exc, exc_info=True)
@@ -486,6 +691,8 @@ def discovery_node(state: PipelineState) -> PipelineState:
         "human_feedback":     "",
         "rejection_feedback": "",
         "healing_iterations": 0,
+        "traceback":                "",
+        "healing_llm_error_context": "",
     }
 
 
@@ -505,6 +712,7 @@ def transform_node(state: PipelineState) -> PipelineState:
     metadata_json       = state.get("input_data", "{}")
     rejection_feedback  = (state.get("rejection_feedback") or "").strip()
     healing_iterations  = state.get("healing_iterations", 0)
+    healing_llm_error_ctx = (state.get("healing_llm_error_context") or "").strip()
 
     logger.info(
         "[Transform] Generating code via Gemini (iter=%d, corrective=%s)",
@@ -538,6 +746,7 @@ def transform_node(state: PipelineState) -> PipelineState:
             "according to reviewer feedback and the schema profile.\n\n"
             f"{few_shot_block}"
             f"{critical_reject}"
+            f"{healing_llm_error_ctx}"
             f"{_GEMINI_TRANSFORM_RULES}\n\n"
             f"REJECTION FEEDBACK: \"{rejection_feedback}\"\n\n"
             "Dataset metadata profile (JSON):\n"
@@ -640,11 +849,23 @@ def healing_node(state: PipelineState) -> PipelineState:
             return {
                 **state,
                 "healing_iterations": new_iterations,
+                "healing_llm_error_context": "",
                 "status": (
                     f"Max healing attempts ({MAX_HEALING_ITERATIONS}) reached. "
                     "Using last generated code."
                 ),
             }
+
+        tb_for_ml = _traceback_for_error_classifier(state, rejection_text)
+        err_cat = _predict_error_category_from_traceback(tb_for_ml)
+        healing_llm_error_context = ""
+        if err_cat:
+            logger.info("[Healing] error_classifier predicted: %s", err_cat[:120])
+            healing_llm_error_context = (
+                "Neuro-symbolic error classification (local ML model on traceback / error text):\n"
+                f"Predicted error category: {err_cat}\n"
+                "Treat this label as a strong prior about the failure mode when revising the code.\n\n"
+            )
 
         return {
             **state,
@@ -654,6 +875,7 @@ def healing_node(state: PipelineState) -> PipelineState:
             "generated_code":      "",
             "edited_code":         "",
             "human_feedback":      feedback,  # preserve for _should_loop_back routing
+            "healing_llm_error_context": healing_llm_error_context,
         }
 
     # ── Approve path ───────────────────────────────────────────────────
@@ -667,6 +889,7 @@ def healing_node(state: PipelineState) -> PipelineState:
         "generated_code":     code,
         "edited_code":        code,
         "rejection_feedback": "",
+        "healing_llm_error_context": "",
         "status":             "Healing Complete",
     }
 
