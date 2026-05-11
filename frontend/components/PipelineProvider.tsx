@@ -21,6 +21,7 @@ import {
   inferPipelineKindFromState,
   mergePollIntoPipelineState,
   orderedStagesForRun,
+  parseMultimodalFromGraphState,
   type PipelineUIState,
 } from "@/lib/pipelineDag";
 
@@ -107,6 +108,8 @@ function apiResponseToPipelineUI(
   const defaultEntry =
     kind === "audio" ? "audio_preprocessing" : "discovery";
 
+  const mm = parseMultimodalFromGraphState(st);
+
   if (paused) {
     const stagesFromState = Array.isArray(st.stages_completed)
       ? (st.stages_completed as string[])
@@ -124,6 +127,7 @@ function apiResponseToPipelineUI(
       generated_code: generated,
       healing_iterations,
       pipeline_kind: kind,
+      ...mm,
     };
   }
 
@@ -145,6 +149,7 @@ function apiResponseToPipelineUI(
     generated_code: generated,
     healing_iterations,
     pipeline_kind: kind,
+    ...mm,
   };
 }
 
@@ -179,6 +184,7 @@ function pausedStateToPipelineUI(
     generated_code: generated,
     healing_iterations,
     pipeline_kind: kind,
+    ...parseMultimodalFromGraphState(state),
   };
 }
 

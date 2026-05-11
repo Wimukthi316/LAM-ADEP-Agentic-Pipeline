@@ -29,6 +29,10 @@ export interface PipelineUIState {
   healing_iterations: number;
   /** Which entry branch the UI + DAG reflect (CSV discovery vs audio preprocessing). */
   pipeline_kind: PipelineKind;
+  /** Whisper / graph transcript for multimodal dashboards. */
+  audio_transcript: string;
+  audio_path: string;
+  audio_classifier_prediction: string;
 }
 
 export const DEFAULT_PIPELINE_UI: PipelineUIState = {
@@ -41,7 +45,50 @@ export const DEFAULT_PIPELINE_UI: PipelineUIState = {
   generated_code: "",
   healing_iterations: 0,
   pipeline_kind: "tabular",
+  audio_transcript: "",
+  audio_path: "",
+  audio_classifier_prediction: "",
 };
+
+/** Pull multimodal fields from LangGraph checkpoint values (and embedded `input_data` JSON). */
+export function parseMultimodalFromGraphState(st: Record<string, unknown>): {
+  audio_transcript: string;
+  audio_path: string;
+  audio_classifier_prediction: string;
+} {
+  let audio_transcript =
+    typeof st.audio_transcript === "string" ? st.audio_transcript : "";
+  let audio_path = typeof st.audio_path === "string" ? st.audio_path : "";
+  let audio_classifier_prediction =
+    typeof st.audio_classifier_prediction === "string"
+      ? st.audio_classifier_prediction
+      : "";
+  const rawInput = st.input_data;
+  if (typeof rawInput === "string" && rawInput.trim().startsWith("{")) {
+    try {
+      const j = JSON.parse(rawInput) as {
+        audio_transcript?: string;
+        audio_path?: string;
+        audio_classifier_prediction?: string | null;
+      };
+      if (!audio_transcript && typeof j.audio_transcript === "string") {
+        audio_transcript = j.audio_transcript;
+      }
+      if (!audio_path && typeof j.audio_path === "string") {
+        audio_path = j.audio_path;
+      }
+      if (
+        !audio_classifier_prediction &&
+        j.audio_classifier_prediction != null
+      ) {
+        audio_classifier_prediction = String(j.audio_classifier_prediction);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return { audio_transcript, audio_path, audio_classifier_prediction };
+}
 
 /** Ordered stages for the execution log / status chips for the active modality. */
 export function orderedStagesForRun(kind: PipelineKind): string[] {
@@ -102,6 +149,17 @@ export function mergePollIntoPipelineState(
     nextKind = "audio";
   }
 
+  const audio_transcript =
+    typeof raw.audio_transcript === "string"
+      ? raw.audio_transcript
+      : prev.audio_transcript;
+  const audio_path =
+    typeof raw.audio_path === "string" ? raw.audio_path : prev.audio_path;
+  const audio_classifier_prediction =
+    typeof raw.audio_classifier_prediction === "string"
+      ? raw.audio_classifier_prediction
+      : prev.audio_classifier_prediction;
+
   return {
     ...prev,
     status,
@@ -119,6 +177,9 @@ export function mergePollIntoPipelineState(
         : prev.generated_code,
     healing_iterations,
     pipeline_kind: nextKind,
+    audio_transcript,
+    audio_path,
+    audio_classifier_prediction,
   };
 }
 

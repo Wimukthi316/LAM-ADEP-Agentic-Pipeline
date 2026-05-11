@@ -3,7 +3,7 @@ LAM-ADEP FastAPI Server v3 — /upload /reject /memory + Dynamic CSV Paths
 """
 from __future__ import annotations
 
-import io, logging, multiprocessing, os, queue, re, traceback, uuid
+import io, json, logging, multiprocessing, os, queue, re, traceback, uuid
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
@@ -394,6 +394,29 @@ def _cfg(thread_id: str) -> dict:
 _latest_status: dict[str, Any] = {}
 _active_csv_path: str | None = CSV_PATH if os.path.isfile(CSV_PATH) else None
 
+
+def _multimodal_status_fields(state: dict[str, Any]) -> dict[str, str]:
+    """Expose transcript / path / classifier on GET /status for multimodal UIs."""
+    transcript = str(state.get("audio_transcript") or "")
+    path = str(state.get("audio_path") or "")
+    pred = ""
+    raw = state.get("input_data")
+    if isinstance(raw, str) and raw.strip().startswith("{"):
+        try:
+            j = json.loads(raw)
+            p = j.get("audio_classifier_prediction")
+            if isinstance(p, str):
+                pred = p
+            elif p is not None:
+                pred = str(p)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+    return {
+        "audio_transcript": transcript,
+        "audio_path": path,
+        "audio_classifier_prediction": pred,
+    }
+
 # Uploaded CSVs land here; paths are validated before use by LangGraph / sandbox.
 _TEMP_DATA_DIR = os.path.join(_BACKEND_DIR, "temp_data")
 
@@ -693,6 +716,7 @@ async def start_pipeline(body: StartRequest):
         "generated_code":    current_state.get("generated_code", ""),
         "active_csv":        os.path.basename(csv_path),
         "healing_iterations": 0,
+        **_multimodal_status_fields(current_state),
     }
 
     return APIResponse(
@@ -789,6 +813,7 @@ async def approve_pipeline(body: ApproveRequest):
             "generated_code":     final_state.get("generated_code", ""),
             "active_csv":         os.path.basename(str(csv_live)),
             "healing_iterations": hit_iter,
+            **_multimodal_status_fields(final_state),
         }
         return APIResponse(
             success=True,
@@ -814,6 +839,7 @@ async def approve_pipeline(body: ApproveRequest):
         "generated_code":    final_state.get("generated_code", ""),
         "sandbox":           sandbox_result,
         "active_csv":        os.path.basename(csv_path),
+        **_multimodal_status_fields(final_state),
     }
 
     return APIResponse(
@@ -889,6 +915,7 @@ async def reject_pipeline(body: RejectRequest):
         "generated_code":    new_code,
         "healing_iterations": new_iter,
         "active_csv":        os.path.basename(csv_path),
+        **_multimodal_status_fields(current_state),
     }
 
     return APIResponse(

@@ -62,6 +62,13 @@ export default function HitlPage() {
   const isRegenerating =
     rejecting || (pipeline.status === "running" && Boolean(pipeline.thread_id));
   const codeForEditor = editedCode.trim() ? editedCode : pipeline.generated_code;
+  /** Paused: always show editor so users can read/edit even before local state syncs. */
+  const showMonacoEditor =
+    isPaused ||
+    ((isCompleted || isRegenerating) && Boolean(codeForEditor.trim()));
+  const monacoValue = isPaused
+    ? editedCode || pipeline.generated_code || ""
+    : codeForEditor;
 
   const stopRecognitionHardware = useCallback(() => {
     try {
@@ -210,7 +217,68 @@ export default function HitlPage() {
             )}
           </button>
         ) : null}
+      </div>
 
+      {showMonacoEditor ? (
+        <div className="glass-card p-5 border border-[#1c2333]/60">
+          <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+            <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">
+              {isPaused ? "Edit before approve" : "Executed code"}
+            </p>
+            <div className="flex items-center gap-2 flex-wrap">
+              {isPaused && !isRegenerating ? (
+                <span className="text-[9px] text-amber-400 bg-amber-400/10 px-2 py-0.5 rounded-full">
+                  Editable
+                </span>
+              ) : null}
+              {isRegenerating ? (
+                <span className="text-[9px] text-cyan-400 bg-cyan-500/10 px-2 py-0.5 rounded-full">
+                  Read-only until ready
+                </span>
+              ) : null}
+            </div>
+          </div>
+          <div className="mb-2 flex justify-center">
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-purple-500/40 bg-purple-500/10 px-3 py-1 text-[10px] font-semibold text-purple-300 shadow-[0_0_18px_-4px_rgba(168,85,247,0.5)] animate-pulse">
+              🧠 Neuro-Symbolic Engine Active
+            </span>
+          </div>
+          <div className="rounded-lg border border-[#1e2a3d] bg-[#0d1117] overflow-hidden">
+            <div className="flex items-center gap-2 px-3 py-2 bg-[#161b22] border-b border-[#1e2a3d]">
+              <span className="text-[10px] text-gray-500 font-mono">
+                transform_output.py
+              </span>
+            </div>
+            <MonacoEditor
+              height="420px"
+              language="python"
+              theme="vs-dark"
+              value={monacoValue}
+              onChange={(val) => setEditedCode(val ?? "")}
+              options={{
+                readOnly: isCompleted || isRegenerating,
+                minimap: { enabled: false },
+                fontSize: 12,
+                lineNumbers: "on",
+                scrollBeyondLastLine: false,
+                wordWrap: "on",
+                automaticLayout: true,
+                padding: { top: 8, bottom: 8 },
+              }}
+            />
+          </div>
+        </div>
+      ) : (
+        <div className="glass-card p-8 text-center text-[12px] text-gray-500">
+          Start the pipeline from the Pipeline page and return here when the run
+          pauses for approval.
+        </div>
+      )}
+
+      <div className="glass-card p-5 border border-[#1c2333]/50">
+        <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-3">
+          Actions
+        </p>
         <div className="flex flex-wrap gap-2">
           <button
             type="button"
@@ -267,55 +335,6 @@ export default function HitlPage() {
           </button>
         </div>
       </div>
-
-      {(isPaused || isCompleted || isRegenerating) && codeForEditor.trim() ? (
-        <div className="glass-card p-5">
-          <div className="flex items-center justify-between mb-3">
-            <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">
-              {isPaused ? "Edit before approve" : "Executed code"}
-            </p>
-            {isPaused && !isRegenerating ? (
-              <span className="text-[9px] text-amber-400 bg-amber-400/10 px-2 py-0.5 rounded-full">
-                Editable
-              </span>
-            ) : null}
-            {isRegenerating ? (
-              <span className="text-[9px] text-cyan-400 bg-cyan-500/10 px-2 py-0.5 rounded-full">
-                Read-only until ready
-              </span>
-            ) : null}
-          </div>
-          <div className="rounded-lg border border-[#1e2a3d] bg-[#0d1117] overflow-hidden">
-            <div className="flex items-center gap-2 px-3 py-2 bg-[#161b22] border-b border-[#1e2a3d]">
-              <span className="text-[10px] text-gray-500 font-mono">
-                transform_output.py
-              </span>
-            </div>
-            <MonacoEditor
-              height="420px"
-              language="python"
-              theme="vs-dark"
-              value={codeForEditor}
-              onChange={(val) => setEditedCode(val ?? "")}
-              options={{
-                readOnly: isCompleted || isRegenerating,
-                minimap: { enabled: false },
-                fontSize: 12,
-                lineNumbers: "on",
-                scrollBeyondLastLine: false,
-                wordWrap: "on",
-                automaticLayout: true,
-                padding: { top: 8, bottom: 8 },
-              }}
-            />
-          </div>
-        </div>
-      ) : (
-        <div className="glass-card p-8 text-center text-[12px] text-gray-500">
-          Start the pipeline from the Pipeline page and return here when the run
-          pauses for approval.
-        </div>
-      )}
 
       {showReject && (
         <div

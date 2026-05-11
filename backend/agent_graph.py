@@ -1148,6 +1148,9 @@ def healing_node(state: PipelineState) -> PipelineState:
         err_cat = _predict_error_category_from_traceback(tb_for_ml)
         healing_llm_error_context = ""
         if err_cat:
+            print(
+                f"\n\033[1;95m🧠 [NEURO-SYMBOLIC ML ACTIVATED] Error Classified as: {err_cat}\033[0m\n"
+            )
             logger.info("[Healing] error_classifier predicted: %s", err_cat[:120])
             healing_llm_error_context = (
                 "Neuro-symbolic error classification (local ML model on traceback / error text):\n"
