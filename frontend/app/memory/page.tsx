@@ -21,7 +21,7 @@ export default function MemoryPage() {
           </h2>
           <p className="text-[11px] text-gray-500 mt-1">
             Documents from Chroma collection{" "}
-            <code className="text-gray-400">rlhf_pipeline_knowledge</code> via{" "}
+            <code className="text-gray-400">approved_transforms</code> via{" "}
             <code className="text-gray-400">GET /memory</code>.
           </p>
         </div>

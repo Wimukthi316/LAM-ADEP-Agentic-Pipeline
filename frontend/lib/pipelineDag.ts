@@ -99,7 +99,7 @@ export function getNodeStatus(
 export function buildNodes(pipelineState: PipelineUIState): Node[] {
   const descriptions: Record<string, string> = {
     discovery: "ydata-profiling discovery (≤6 KB JSON)",
-    transform: "Gemini 1.5 Flash + HITL gate",
+    transform: "Gemini 2.5 Flash + HITL gate",
     healing: "Reject routing & corrective loop (max 3)",
     orchestrator: "ChromaDB RLHF persistence",
   };

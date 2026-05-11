@@ -32,6 +32,8 @@ export default function HitlPage() {
 
   const isPaused = pipeline.status === "paused";
   const isCompleted = pipeline.status === "completed";
+  const isRegenerating =
+    rejecting || (pipeline.status === "running" && Boolean(pipeline.thread_id));
   const codeForEditor = editedCode.trim() ? editedCode : pipeline.generated_code;
 
   const submitReject = async () => {
@@ -62,18 +64,28 @@ export default function HitlPage() {
           <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
             Adaptive HITL
           </h3>
-          {isPaused && (
+          {isPaused && !isRegenerating && (
             <span className="ml-auto text-[10px] font-medium text-amber-400 bg-amber-400/10 px-2 py-0.5 rounded-full">
               Action required
             </span>
           )}
         </div>
 
-        {isPaused ? (
+        {isRegenerating ? (
+          <div className="flex items-center gap-2 text-[11px] text-cyan-300/90 mb-4 py-2 px-3 rounded-lg bg-cyan-500/10 border border-cyan-500/20">
+            <Loader2 size={14} className="animate-spin shrink-0" />
+            <span>
+              Gemini is regenerating transformation code from your feedback…
+            </span>
+          </div>
+        ) : null}
+
+        {isPaused && !isRegenerating ? (
           <p className="text-[11px] text-amber-300/80 mb-4 leading-relaxed">
-            Reject sends structured feedback to Gemini for a corrective
-            regeneration (max 3 iterations). Approve executes your edited script
-            in the sandbox, then completes the graph.
+            Reject opens a modal and sends{" "}
+            <code className="text-gray-400">feedback_text</code> to POST{" "}
+            <code className="text-gray-400">/reject</code> (max 3 iterations).
+            Approve runs your edited script in the sandbox, then completes the graph.
           </p>
         ) : null}
 
@@ -99,10 +111,10 @@ export default function HitlPage() {
           <button
             type="button"
             onClick={() => void approvePipeline()}
-            disabled={!isPaused || approving}
+            disabled={!isPaused || approving || isRegenerating}
             className={`flex-1 py-2.5 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5
                     ${
-                      isPaused && !approving
+                      isPaused && !approving && !isRegenerating
                         ? "bg-gradient-to-r from-emerald-500 to-teal-600 text-white"
                         : "bg-[#1c2333] text-gray-600 cursor-not-allowed"
                     }`}
@@ -117,10 +129,10 @@ export default function HitlPage() {
           <button
             type="button"
             onClick={() => setShowReject(true)}
-            disabled={!isPaused || rejecting}
+            disabled={!isPaused || rejecting || isRegenerating}
             className={`flex-1 py-2.5 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5
                     ${
-                      isPaused && !rejecting
+                      isPaused && !rejecting && !isRegenerating
                         ? "bg-gradient-to-r from-rose-500 to-pink-600 text-white"
                         : "bg-[#1c2333] text-gray-600 cursor-not-allowed"
                     }`}
@@ -131,15 +143,20 @@ export default function HitlPage() {
         </div>
       </div>
 
-      {(isPaused || isCompleted) && codeForEditor.trim() ? (
+      {(isPaused || isCompleted || isRegenerating) && codeForEditor.trim() ? (
         <div className="glass-card p-5">
           <div className="flex items-center justify-between mb-3">
             <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">
               {isPaused ? "Edit before approve" : "Executed code"}
             </p>
-            {isPaused ? (
+            {isPaused && !isRegenerating ? (
               <span className="text-[9px] text-amber-400 bg-amber-400/10 px-2 py-0.5 rounded-full">
                 Editable
+              </span>
+            ) : null}
+            {isRegenerating ? (
+              <span className="text-[9px] text-cyan-400 bg-cyan-500/10 px-2 py-0.5 rounded-full">
+                Read-only until ready
               </span>
             ) : null}
           </div>
@@ -156,7 +173,7 @@ export default function HitlPage() {
               value={codeForEditor}
               onChange={(val) => setEditedCode(val ?? "")}
               options={{
-                readOnly: isCompleted,
+                readOnly: isCompleted || isRegenerating,
                 minimap: { enabled: false },
                 fontSize: 12,
                 lineNumbers: "on",

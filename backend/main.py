@@ -3,7 +3,7 @@ LAM-ADEP FastAPI Server v3 — /upload /reject /memory + Dynamic CSV Paths
 """
 from __future__ import annotations
 
-import io, logging, multiprocessing, os, queue, time, traceback, uuid
+import io, logging, multiprocessing, os, queue, re, traceback, uuid
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
@@ -40,6 +40,10 @@ def _sandbox_worker(
     result_queue: multiprocessing.Queue,
 ) -> None:
     import sys
+
+    import numpy as np
+    import pandas as pd
+
     stdout_buf, stderr_buf = io.StringIO(), io.StringIO()
     try:
         for old, new in [
@@ -53,14 +57,33 @@ def _sandbox_worker(
             code = code.replace(old, new)
 
         sys.stdout, sys.stderr = stdout_buf, stderr_buf
-        exec(compile(code, "<sandbox>", "exec"),  # noqa: S102
-             {
-                 "__builtins__": __builtins__,
-                 "CSV_PATH": csv_path,
-                 "CLEANED_PATH": cleaned_path,
-                 "INPUT_CSV": csv_path,
-                 "OUTPUT_CSV": cleaned_path,
-             })
+        sandbox_globals: dict[str, Any] = {
+            "__builtins__": __builtins__,
+            "pd": pd,
+            "np": np,
+            "CSV_PATH": csv_path,
+            "CLEANED_PATH": cleaned_path,
+            "INPUT_CSV": csv_path,
+            "OUTPUT_CSV": cleaned_path,
+        }
+        exec(compile(code, "<sandbox>", "exec"), sandbox_globals)  # noqa: S102
+        transform_fn = sandbox_globals.get("transform_data")
+        if not callable(transform_fn):
+            raise RuntimeError(
+                "Generated code must define a callable transform_data(df). "
+                "Exec completed but transform_data is missing or not a function."
+            )
+        df_in = pd.read_csv(csv_path, low_memory=False)
+        df_out = transform_fn(df_in)
+        if df_out is None:
+            raise RuntimeError("transform_data returned None; expected a pandas DataFrame.")
+        if not isinstance(df_out, pd.DataFrame):
+            raise TypeError(
+                f"transform_data must return a pandas DataFrame; got {type(df_out).__name__}."
+            )
+        df_out.to_csv(cleaned_path, index=False)
+        print(f"Sandbox: wrote {len(df_out)} rows to cleaned CSV.", flush=True)
+
         sys.stdout, sys.stderr = sys.__stdout__, sys.__stderr__
         result_queue.put({"success": True, "stdout": stdout_buf.getvalue(), "stderr": stderr_buf.getvalue()})
     except Exception as exc:
@@ -117,7 +140,47 @@ def resolve_analytics_csv(csv_filename: str | None) -> str | None:
     return None
 
 
+def _slug_series_key(col_name: str, used: set[str]) -> str:
+    """Stable JSON key for a column name (avoids collisions)."""
+    base = re.sub(r"[^\w]+", "_", str(col_name).strip()).strip("_").lower() or "metric"
+    key = base
+    n = 2
+    while key in used:
+        key = f"{base}_{n}"
+        n += 1
+    used.add(key)
+    return key
+
+
+def _numeric_columns(df: pd.DataFrame, limit: int = 8) -> list[str]:
+    """Ordered list of columns treatable as numeric (up to *limit* candidates)."""
+    out: list[str] = []
+    for c in df.columns:
+        if pd.api.types.is_numeric_dtype(df[c]):
+            out.append(str(c))
+            if len(out) >= limit:
+                break
+    return out
+
+
+def _first_datetime_series(df: pd.DataFrame) -> tuple[str | None, pd.Series | None]:
+    """Pick first column that yields a usable datetime series for grouping."""
+    for c in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[c]):
+            ts = pd.to_datetime(df[c], errors="coerce")
+            if ts.notna().any():
+                return str(c), ts
+    for c in df.columns:
+        if df[c].dtype == object or pd.api.types.is_string_dtype(df[c]):
+            ts = pd.to_datetime(df[c], errors="coerce")
+            ratio = float(ts.notna().sum()) / max(len(df), 1)
+            if ratio >= 0.5 and ts.notna().any():
+                return str(c), ts
+    return None, None
+
+
 def compute_analytics(csv_path: str | None = None) -> dict[str, Any]:
+    """Schema-agnostic analytics: metric cards + optional daily aggregates by first date column."""
     path = csv_path
     if not path:
         path = resolve_analytics_csv(None)
@@ -130,58 +193,82 @@ def compute_analytics(csv_path: str | None = None) -> dict[str, Any]:
     try:
         df = pd.read_csv(path)
     except Exception as exc:
+        logger.warning("[Analytics] read_csv failed: %s", exc)
         return {"success": False, "error": "READ_FAILED", "message": str(exc)}
 
     row_count = int(len(df))
+    metrics: list[dict[str, Any]] = [{"label": "Total Rows", "value": float(row_count)}]
 
-    def _num(col: str) -> float:
+    numeric_cols = _numeric_columns(df, limit=8)
+    agg_cols = numeric_cols[:3]
+
+    for col in agg_cols:
         try:
-            return float(pd.to_numeric(df[col], errors="coerce").mean(skipna=True) or 0)
-        except Exception:
-            return 0.0
-
-    def _sum(col: str) -> float:
-        try:
-            return float(pd.to_numeric(df[col], errors="coerce").sum(skipna=True) or 0)
-        except Exception:
-            return 0.0
-
-    avg_unit_price  = _num("Unit price")
-    sum_gross       = _sum("gross income")
-    sum_total       = _sum("Total")
-
-    daily_sales: list[dict] = []
-    try:
-        w = df.copy()
-        w["_date"]  = pd.to_datetime(w["Date"], errors="coerce") if "Date" in w.columns else pd.NaT
-        w["_total"] = pd.to_numeric(w["Total"], errors="coerce") if "Total" in w.columns else 0.0
-        w["_gi"]    = pd.to_numeric(w["gross income"], errors="coerce") if "gross income" in w.columns else 0.0
-        w["_day"]   = w["_date"].dt.normalize()
-        dated = w.dropna(subset=["_date"])
-        if not dated.empty:
-            daily = (
-                dated.groupby("_day", as_index=False)
-                .agg(dt=("_total", "sum"), dg=("_gi", "sum"))
-                .rename(columns={"_day": "_date"})
-                .sort_values("_date").head(10)
-            )
-            for _, row in daily.iterrows():
-                ts = pd.Timestamp(row["_date"])
-                daily_sales.append({
-                    "date": ts.strftime("%Y-%m-%d"), "label": ts.strftime("%b %d"),
-                    "total_sales": round(float(row["dt"]), 2),
-                    "gross_income": round(float(row["dg"]), 2),
+            ser = pd.to_numeric(df[col], errors="coerce")
+            mu = ser.mean(skipna=True)
+            if pd.notna(mu):
+                metrics.append({
+                    "label": f"Avg {col}",
+                    "value": round(float(mu), 6),
                 })
-    except Exception as exc:
-        logger.warning("Daily aggregation skipped: %s", exc)
+        except Exception as exc:
+            logger.debug("[Analytics] skip avg for column %r: %s", col, exc)
+
+    daily_sales: list[dict[str, Any]] = []
+    daily_series: list[dict[str, str]] = []
+
+    date_col, dt_series = _first_datetime_series(df)
+    chart_numeric = numeric_cols[:2]
+
+    if date_col is None or dt_series is None or not chart_numeric:
+        logger.info(
+            "[Analytics] daily_sales skipped (date=%s, numeric_cols=%d)",
+            date_col,
+            len(chart_numeric),
+        )
+    else:
+        try:
+            used_keys: set[str] = set()
+            slug_by_col: dict[str, str] = {}
+            for c in chart_numeric:
+                slug_by_col[c] = _slug_series_key(c, used_keys)
+
+            w = pd.DataFrame({"_dt": dt_series})
+            for c in chart_numeric:
+                w[c] = pd.to_numeric(df[c], errors="coerce")
+            w["_day"] = w["_dt"].dt.normalize()
+            dated = w.dropna(subset=["_dt"])
+            if not dated.empty:
+                agg_map = {c: "sum" for c in chart_numeric}
+                grouped = (
+                    dated.groupby("_day", as_index=False)
+                    .agg(agg_map)
+                    .sort_values("_day")
+                    .head(10)
+                )
+                for _, row in grouped.iterrows():
+                    day_ts = pd.Timestamp(row["_day"])
+                    pt: dict[str, Any] = {
+                        "date": day_ts.strftime("%Y-%m-%d"),
+                        "label": day_ts.strftime("%b %d"),
+                    }
+                    for c in chart_numeric:
+                        sk = slug_by_col[c]
+                        raw_v = row[c]
+                        pt[sk] = round(float(raw_v), 4) if pd.notna(raw_v) else 0.0
+                    daily_sales.append(pt)
+                daily_series = [
+                    {"key": slug_by_col[c], "label": f"Sum {c} (daily)"}
+                    for c in chart_numeric
+                ]
+        except Exception as exc:
+            logger.warning("[Analytics] daily aggregation failed: %s", exc, exc_info=True)
 
     return {
         "success": True,
-        "row_count": row_count,
-        "avg_unit_price": round(avg_unit_price, 4),
-        "sum_gross_income": round(sum_gross, 2),
-        "sum_total_sales": round(sum_total, 2),
+        "metrics": metrics,
         "daily_sales": daily_sales,
+        "daily_series": daily_series,
         "dataset_file": os.path.basename(path),
     }
 
@@ -190,11 +277,9 @@ def _empty_analytics_payload(note: str | None = None) -> dict[str, Any]:
     """Stable shape when no CSV is available or analytics fails."""
     body: dict[str, Any] = {
         "success": True,
-        "row_count": 0,
-        "avg_unit_price": 0.0,
-        "sum_gross_income": 0.0,
-        "sum_total_sales": 0.0,
+        "metrics": [{"label": "Total Rows", "value": 0.0}],
         "daily_sales": [],
+        "daily_series": [],
         "dataset_file": None,
     }
     if note:
@@ -281,7 +366,10 @@ class ApproveRequest(BaseModel):
 
 class RejectRequest(BaseModel):
     thread_id: str
-    feedback:  str = Field(default="", description="Human reviewer's textual feedback for Gemini.")
+    feedback_text: str = Field(
+        default="",
+        description="Human reviewer's textual feedback for the corrective Gemini pass.",
+    )
 
 class APIResponse(BaseModel):
     success:   bool = True
@@ -474,7 +562,7 @@ async def get_memory():
         chroma_dir = os.path.join(_BACKEND_DIR, "chroma_db")
         os.makedirs(chroma_dir, exist_ok=True)
         client     = chromadb.PersistentClient(path=chroma_dir)
-        collection = client.get_or_create_collection("rlhf_pipeline_knowledge")
+        collection = client.get_or_create_collection("approved_transforms")
         results    = collection.get(include=["documents", "metadatas"])
 
         if not isinstance(results, dict):
@@ -489,15 +577,23 @@ async def get_memory():
                 doc_raw, meta_raw = docs[i], metas[i]
                 if doc_raw is None and meta_raw is None:
                     continue
-                code = doc_raw if isinstance(doc_raw, str) else (
-                    "" if doc_raw is None else str(doc_raw)
-                )
+                meta: dict[str, Any]
                 if isinstance(meta_raw, dict):
-                    meta: dict[str, Any] = dict(meta_raw)
+                    meta = dict(meta_raw)
                 elif meta_raw is None:
                     meta = {}
                 else:
                     meta = {"value": meta_raw}
+                code_from_meta = meta.get("approved_code") if meta else None
+                code = (
+                    str(code_from_meta).strip()
+                    if code_from_meta is not None and str(code_from_meta).strip()
+                    else (
+                        doc_raw
+                        if isinstance(doc_raw, str)
+                        else ("" if doc_raw is None else str(doc_raw))
+                    )
+                )
                 memory.append({"code": code, "metadata": meta})
             except Exception:
                 continue
@@ -729,6 +825,7 @@ async def reject_pipeline(body: RejectRequest):
     config   = _cfg(body.thread_id)
     snapshot = _compiled_graph.get_state(config)
     if not snapshot or not snapshot.next:
+        logger.info("[Reject] No paused graph for thread_id=%s", body.thread_id)
         return APIResponse(success=False, thread_id=body.thread_id,
                            message="No paused pipeline for this thread_id.")
 
@@ -736,6 +833,11 @@ async def reject_pipeline(body: RejectRequest):
     current_iter = state_values.get("healing_iterations", 0)
 
     if current_iter >= MAX_HEALING_ITERATIONS:
+        logger.info(
+            "[Reject] Blocked — max healing iterations (%s/%s)",
+            current_iter,
+            MAX_HEALING_ITERATIONS,
+        )
         return APIResponse(
             success=False, thread_id=body.thread_id,
             message=(
@@ -744,14 +846,22 @@ async def reject_pipeline(body: RejectRequest):
             ),
         )
 
-    feedback_text = (body.feedback or "").strip() or "Please improve the generated code."
-    resume_value  = f"Reject:{feedback_text}"
+    feedback_text = (body.feedback_text or "").strip() or "Please improve the generated code."
+    resume_value  = f"Reject: {feedback_text}"
 
     logger.info("[Reject] Thread %s — iter %d — feedback: %s",
-                body.thread_id, current_iter, feedback_text[:80])
+                body.thread_id, current_iter, feedback_text[:120])
 
-    # Invoke resumes transform → healing → (back to) transform → NEW interrupt
-    _compiled_graph.invoke(Command(resume=resume_value), config=config)
+    try:
+        _compiled_graph.invoke(Command(resume=resume_value), config=config)
+        logger.info("[Reject] Graph resume completed for thread_id=%s", body.thread_id)
+    except Exception as exc:
+        logger.error("[Reject] invoke failed: %s", exc, exc_info=True)
+        return APIResponse(
+            success=False,
+            thread_id=body.thread_id,
+            message=f"Healing resume failed: {exc}",
+        )
 
     snapshot2     = _compiled_graph.get_state(config)
     current_state = _to_dict(snapshot2)

@@ -1,6 +1,6 @@
 "use client";
 
-import React from "react";
+import React, { useMemo } from "react";
 import {
   Line,
   XAxis,
@@ -11,11 +11,16 @@ import {
   LineChart,
 } from "recharts";
 
-export interface DailySalesPoint {
+export interface DailyChartSeries {
+  key: string;
+  label: string;
+}
+
+/** Row for Recharts: date + label + one numeric field per daily_chart_series.key */
+export interface DailySeriesPoint {
   date: string;
   label: string;
-  total_sales: number;
-  gross_income: number;
+  [metricKey: string]: string | number;
 }
 
 interface TooltipPayloadEntry {
@@ -57,31 +62,31 @@ function SalesTooltip({ active, payload, label }: SalesTooltipProps) {
   );
 }
 
+const SERIES_COLORS = ["#22d3ee", "#a855f7", "#34d399", "#fbbf24", "#f472b6"];
+
 export default function AnalyticsChart({
   dailySales,
+  dailySeries,
   loading,
   errorMessage,
   datasetSubtitle,
 }: {
-  dailySales: DailySalesPoint[];
+  dailySales: DailySeriesPoint[];
+  dailySeries: DailyChartSeries[];
   loading: boolean;
   errorMessage: string | null;
-  /** Shown in subtitle when set (e.g. active CSV basename). */
   datasetSubtitle?: string | null;
 }) {
-  const empty = !loading && (!dailySales || dailySales.length === 0);
+  const empty = !loading && (!dailySales?.length || !dailySeries?.length);
   const subtitle = loading
     ? "Loading dataset metrics…"
     : errorMessage
       ? errorMessage
       : datasetSubtitle
-        ? `Daily totals from ${datasetSubtitle} (sample series)`
-        : "Daily totals from the active dataset (first 10 days)";
+        ? `Daily aggregates from ${datasetSubtitle} (first date column, up to 10 days)`
+        : "Daily aggregates when a date-like column is detected";
 
-  const chartBlock = (
-    msg: string,
-    height = 220
-  ) => (
+  const chartBlock = (msg: string, height = 260) => (
     <div
       className="flex items-center justify-center text-[11px] text-gray-500 border border-dashed border-[#1c2333] rounded-lg"
       style={{ height }}
@@ -90,89 +95,68 @@ export default function AnalyticsChart({
     </div>
   );
 
+  const lines = useMemo(
+    () =>
+      (dailySeries ?? []).map((s, i) => ({
+        ...s,
+        color: SERIES_COLORS[i % SERIES_COLORS.length],
+      })),
+    [dailySeries]
+  );
+
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-      <div className="glass-card p-6">
-        <div className="flex items-center justify-between mb-6">
-          <div>
-            <h3 className="text-sm font-semibold text-white">
-              Daily sales (Total)
-            </h3>
-            <p className="text-[11px] text-gray-500 mt-0.5">{subtitle}</p>
-          </div>
-          <div className="flex gap-4 text-[10px]">
-            <div className="flex items-center gap-1.5">
-              <div className="w-2 h-2 rounded-full bg-cyan-400" />
-              <span className="text-gray-400">Sales</span>
-            </div>
-          </div>
-
+    <div className="glass-card p-6">
+      <div className="flex flex-wrap items-start justify-between gap-4 mb-6">
+        <div>
+          <h3 className="text-sm font-semibold text-white">
+            Daily trends (detected date column)
+          </h3>
+          <p className="text-[11px] text-gray-500 mt-0.5">{subtitle}</p>
         </div>
-        {loading ? (
-          chartBlock("Loading chart…")
-        ) : errorMessage || empty ? (
-          chartBlock(errorMessage || "No daily sales data to display.")
-        ) : (
-          <ResponsiveContainer width="100%" height={220}>
-            <LineChart data={dailySales}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#1c2333" />
-              <XAxis dataKey="label" stroke="#384868" tick={{ fontSize: 11 }} />
-              <YAxis stroke="#384868" tick={{ fontSize: 11 }} />
-              <Tooltip content={<SalesTooltip />} />
-              <Line
-                type="monotone"
-                dataKey="total_sales"
-                name="Total sales"
-                stroke="#22d3ee"
-                strokeWidth={2}
-                dot={{ r: 3, fill: "#22d3ee", strokeWidth: 0 }}
-                activeDot={{ r: 5, fill: "#22d3ee" }}
-              />
-            </LineChart>
-          </ResponsiveContainer>
-        )}
+        {lines.length > 0 ? (
+          <div className="flex flex-wrap gap-4 text-[10px]">
+            {lines.map((s) => (
+              <div key={s.key} className="flex items-center gap-1.5">
+                <div
+                  className="w-2 h-2 rounded-full shrink-0"
+                  style={{ background: s.color }}
+                />
+                <span className="text-gray-400">{s.label}</span>
+              </div>
+            ))}
+          </div>
+        ) : null}
       </div>
 
-      <div className="glass-card p-6">
-        <div className="flex items-center justify-between mb-6">
-          <div>
-            <h3 className="text-sm font-semibold text-white">
-              Daily gross income
-            </h3>
-            <p className="text-[11px] text-gray-500 mt-0.5">{subtitle}</p>
-          </div>
-          <div className="flex gap-4 text-[10px]">
-            <div className="flex items-center gap-1.5">
-              <div className="w-2 h-2 rounded-full bg-purple-400" />
-              <span className="text-gray-400">Gross income</span>
-            </div>
-          </div>
-
-        </div>
-        {loading ? (
-          chartBlock("Loading chart…")
-        ) : errorMessage || empty ? (
-          chartBlock(errorMessage || "No gross income series to display.")
-        ) : (
-          <ResponsiveContainer width="100%" height={220}>
-            <LineChart data={dailySales}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#1c2333" />
-              <XAxis dataKey="label" stroke="#384868" tick={{ fontSize: 11 }} />
-              <YAxis stroke="#384868" tick={{ fontSize: 11 }} />
-              <Tooltip content={<SalesTooltip />} />
+      {loading ? (
+        chartBlock("Loading chart…")
+      ) : errorMessage || empty ? (
+        chartBlock(
+          errorMessage ||
+            "No daily time-series — need a parseable date column and numeric columns."
+        )
+      ) : (
+        <ResponsiveContainer width="100%" height={260}>
+          <LineChart data={dailySales}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#1c2333" />
+            <XAxis dataKey="label" stroke="#384868" tick={{ fontSize: 11 }} />
+            <YAxis stroke="#384868" tick={{ fontSize: 11 }} />
+            <Tooltip content={<SalesTooltip />} />
+            {lines.map((s) => (
               <Line
+                key={s.key}
                 type="monotone"
-                dataKey="gross_income"
-                name="Gross income"
-                stroke="#a855f7"
+                dataKey={s.key}
+                name={s.label}
+                stroke={s.color}
                 strokeWidth={2}
-                dot={{ r: 3, fill: "#a855f7", strokeWidth: 0 }}
-                activeDot={{ r: 5, fill: "#a855f7" }}
+                dot={{ r: 3, fill: s.color, strokeWidth: 0 }}
+                activeDot={{ r: 5, fill: s.color }}
               />
-            </LineChart>
-          </ResponsiveContainer>
-        )}
-      </div>
+            ))}
+          </LineChart>
+        </ResponsiveContainer>
+      )}
     </div>
   );
 }

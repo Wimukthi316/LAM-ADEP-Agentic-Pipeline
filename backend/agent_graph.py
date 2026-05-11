@@ -8,7 +8,7 @@ Architecture
 - LLM         : Google Gemini 2.5 Flash (google.generativeai)
 - Profiler     : ydata-profiling minimal → surgical JSON extraction (≤6 KB)
                  Fallback: custom pandas profiler if ydata-profiling unavailable
-- Vector DB   : ChromaDB persistent (RLHF knowledge store)
+- Vector DB   : ChromaDB persistent (`approved_transforms` policy memory)
 - Sandbox     : multiprocessing exec() — handled in FastAPI /approve endpoint
 
 Graph Topology (v3 — with healing back-edge)
@@ -19,20 +19,24 @@ Graph Topology (v3 — with healing back-edge)
                   ↓  (approve OR max iters)
             orchestrator → END
 
-Checkpointing: MemorySaver (in-memory, thread-safe).
+Checkpointing: SQLite (`checkpoints.db`) via SqliteSaver (persistent per thread_id).
 """
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import os
 import re
+import sqlite3
+import time
+import uuid
 from typing import TypedDict
 
 import pandas as pd
 from dotenv import load_dotenv
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
 from langgraph.types import interrupt
 
@@ -52,6 +56,77 @@ CLEANED_PATH = os.path.join(_DATA_DIR, "cleaned_sales.csv")
 
 # Max healing loop iterations before forcing orchestrator
 MAX_HEALING_ITERATIONS = 3
+
+# ChromaDB policy memory (persistent RLHF / approved transforms)
+_CHROMA_DB_PATH = os.path.join(_BACKEND_DIR, "chroma_db")
+_APPROVED_TRANSFORMS_COLLECTION = "approved_transforms"
+_chroma_persistent_client = None
+
+
+def _get_chroma_persistent_client():
+    """Lazy singleton PersistentClient under backend/chroma_db/."""
+    global _chroma_persistent_client
+    if _chroma_persistent_client is None:
+        try:
+            import chromadb  # type: ignore
+
+            os.makedirs(_CHROMA_DB_PATH, exist_ok=True)
+            _chroma_persistent_client = chromadb.PersistentClient(path=_CHROMA_DB_PATH)
+            logger.info(
+                "[ChromaDB] Persistent client ready at %s",
+                os.path.abspath(_CHROMA_DB_PATH),
+            )
+        except Exception as exc:
+            logger.error("[ChromaDB] Failed to init client: %s", exc, exc_info=True)
+            raise
+    return _chroma_persistent_client
+
+
+def _get_approved_transforms_collection():
+    """Collection: document = schema/metadata JSON; metadata holds approved code + timestamp."""
+    client = _get_chroma_persistent_client()
+    return client.get_or_create_collection(
+        name=_APPROVED_TRANSFORMS_COLLECTION,
+        metadata={"description": "Human-approved transform snippets keyed by dataset schema"},
+    )
+
+
+def _retrieve_similar_approved_code(metadata_json: str) -> str | None:
+    """RAG: similarity search on stored schema profiles; returns approved code from metadata."""
+    if not (metadata_json or "").strip():
+        logger.info("[Transform/RAG] Empty input_data — skipping retrieval.")
+        return None
+    try:
+        collection = _get_approved_transforms_collection()
+        try:
+            n_docs = collection.count()
+        except Exception as cnt_exc:
+            logger.warning("[Transform/RAG] count() failed: %s", cnt_exc)
+            n_docs = 0
+        if n_docs == 0:
+            logger.info("[Transform/RAG] Collection empty — no few-shot injection.")
+            return None
+
+        result = collection.query(query_texts=[metadata_json], n_results=1)
+        metas_nested = result.get("metadatas") if isinstance(result, dict) else None
+        if not metas_nested or not isinstance(metas_nested[0], list):
+            logger.info("[Transform/RAG] No metadata in query result.")
+            return None
+        meta0 = metas_nested[0][0] if metas_nested[0] else None
+        if not isinstance(meta0, dict):
+            return None
+        code = meta0.get("approved_code")
+        if code is None:
+            return None
+        snippet = str(code).strip()
+        if not snippet:
+            logger.info("[Transform/RAG] Hit had empty approved_code metadata.")
+            return None
+        logger.info("[Transform/RAG] Retrieved similar approved snippet (%d chars)", len(snippet))
+        return snippet
+    except Exception as exc:
+        logger.warning("[Transform/RAG] Retrieval skipped: %s", exc, exc_info=True)
+        return None
 
 # Gemini prompt budget — compact profile JSON only (no raw ProfileReport HTML/JSON)
 _MAX_METADATA_BYTES = 6000
@@ -76,38 +151,73 @@ def _derive_cleaned_path(csv_path: str) -> str:
 # ---------------------------------------------------------------------------
 _gemini_model = None
 
-TRANSFORM_CODE_FALLBACK = (
-    "# Fallback: Gemini did not return valid code.\n"
-    "# Please check GEMINI_API_KEY and retry.\n"
-    "import pandas as pd\n\n"
-    "df = pd.read_csv(INPUT_CSV, low_memory=False)\n"
-    "df.drop_duplicates(inplace=True)\n"
-    "for _col in list(df.select_dtypes(include=['number']).columns):\n"
-    "    if not df[_col].isna().any():\n"
-    "        continue\n"
-    "    _med = df[_col].median()\n"
-    "    if pd.notna(_med):\n"
-    "        df[_col] = df[_col].fillna(_med)\n"
-    "        continue\n"
-    "    _mean = df[_col].mean()\n"
-    "    if pd.notna(_mean):\n"
-    "        df[_col] = df[_col].fillna(_mean)\n"
-    "        continue\n"
-    "    df.drop(columns=[_col], inplace=True)\n"
-    "for _col in df.select_dtypes(include=['object', 'string']).columns:\n"
-    "    df[_col] = df[_col].fillna('')\n"
-    "df.dropna(how='all', inplace=True)\n"
-    "df.to_csv(OUTPUT_CSV, index=False)\n"
-    "print(f'Fallback: wrote {len(df)} rows to OUTPUT_CSV')\n"
-)
+TRANSFORM_CODE_FALLBACK = """def transform_data(df):
+    \"\"\"Fallback when Gemini is unavailable — hygiene + imputation; returns DataFrame.\"\"\"
+    df = df.copy()
+    df.drop_duplicates(inplace=True)
+    for _col in list(df.select_dtypes(include=["number"]).columns):
+        if not df[_col].isna().any():
+            continue
+        _med = df[_col].median()
+        if pd.notna(_med):
+            df[_col] = df[_col].fillna(_med)
+            continue
+        _mean = df[_col].mean()
+        if pd.notna(_mean):
+            df[_col] = df[_col].fillna(_mean)
+            continue
+        df.drop(columns=[_col], inplace=True)
+    for _col in df.select_dtypes(include=["object", "string"]).columns:
+        df[_col] = df[_col].fillna("")
+    df.dropna(how="all", inplace=True)
+    print(f"Fallback transform_data: {len(df)} rows")
+    return df
+"""
 
 
-_GEMINI_TRANSFORM_RULES = """CRITICAL RULES YOU MUST FOLLOW:
-1. NO SAMPLING: NEVER use `nrows`, `.head()`, or any sampling inside or chained from `pd.read_csv()`. Load the full dataset with `pd.read_csv(INPUT_CSV, low_memory=False)`.
-2. GLOBALLY DEFINED PATHS: NEVER assign or redefine `INPUT_CSV` or `OUTPUT_CSV`. They exist in the runtime; use them only as `pd.read_csv(INPUT_CSV)` and `df.to_csv(OUTPUT_CSV, index=False)`. Never hardcode disk paths.
-3. DATA HYGIENE & SMART IMPUTATION: Always `df.drop_duplicates(inplace=True)`. NEVER blindly `fillna(0)` on numeric columns. Use per-column median or mean where sensible; if a numeric column cannot be imputed without distorting metrics (e.g. no valid median/mean), drop that column or rows per sound judgment — do not zero-fill by default.
-4. OUTPUT FORMAT: Save only with `df.to_csv(OUTPUT_CSV, index=False)`.
-5. OUTPUT ONLY CODE: Return ONLY executable Python — no markdown fences, no explanations."""
+def _strip_llm_code_fences(text: str) -> str:
+    """Remove common markdown code fences from model output."""
+    t = (text or "").strip()
+    if not t:
+        return t
+    t = re.sub(r"^\s*```(?:python|py)?\s*\r?\n?", "", t, count=1, flags=re.IGNORECASE)
+    t = re.sub(r"\r?\n?\s*```\s*$", "", t, count=1)
+    return t.strip()
+
+
+def _extract_transform_data_function(source: str) -> str:
+    """Keep only `def transform_data(df): ...` when possible; drop prose / extra cells."""
+    body = _strip_llm_code_fences(source).strip()
+    if not body:
+        return body
+    try:
+        tree = ast.parse(body)
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name == "transform_data":
+                seg = ast.get_source_segment(body, node)
+                if seg:
+                    return seg.strip()
+    except SyntaxError:
+        logger.debug("[Transform] ast.parse failed; falling back to regex slice.")
+
+    m = re.search(
+        r"(?ms)^def\s+transform_data\s*\(\s*df\s*\)\s*:.*",
+        body,
+    )
+    if m:
+        return m.group(0).strip()
+    return body
+
+
+_GEMINI_TRANSFORM_RULES = """OUTPUT CONTRACT — VIOLATION OF ANY RULE INVALIDATES YOUR ANSWER:
+
+1. SINGLE TOP-LEVEL FUNCTION ONLY: Output exactly ONE Python function, named precisely `transform_data`, with signature `def transform_data(df):` (single argument `df`). Do NOT output a flat script, module boilerplate, or multiple definitions at module level except this one function.
+2. NO IMPORTS: Do NOT write `import`, `from ... import`, or `__import__`. The runtime already provides `pd` (pandas) and `np` (numpy) in global scope inside your execution environment.
+3. NO I/O: Do NOT call `pd.read_csv`, `pd.read_table`, `to_csv`, `open()`, or any file/path/API reads or writes. Only mutate the passed-in `df` (prefer `df = df.copy()` first if you avoid inplace ops) and `return df` at the end.
+4. NO SAMPLING THE INPUT: Do NOT use `.head()`, `.tail()`, `.sample()`, `nrows=`, or otherwise discard rows to approximate the full dataset. Transform every row of `df`.
+5. HYGIENE: Include sensible cleaning (e.g. dedupe, typed fills). NEVER blindly `fillna(0)` on numeric columns unless the schema clearly warrants it; prefer median/mean or drop when justified.
+6. RETURN VALUE: Always `return df` with `df` a pandas DataFrame.
+7. PURE CODE ONLY: Output ONLY the Python function — NO markdown fences, NO backticks, NO explanations before or after the code."""
 
 
 GEMINI_MODEL = "models/gemini-2.5-flash"
@@ -336,7 +446,7 @@ class PipelineState(TypedDict):
     status:             str   # Human-readable status tag
     generated_code:     str   # Latest LLM-generated cleaning code
     edited_code:        str   # User-edited version (from Monaco Editor)
-    human_feedback:     str   # Latest HITL decision: "Approve" | "Reject:<text>"
+    human_feedback:     str   # Latest HITL decision: "Approve" | "Reject: <text>"
     rejection_feedback: str   # Extracted text from the last rejection
     healing_iterations: int   # Reject loop counter (capped at MAX_HEALING_ITERATIONS)
 
@@ -402,30 +512,51 @@ def transform_node(state: PipelineState) -> PipelineState:
     )
     logger.info("[Transform] Sandbox paths INPUT_CSV=%s OUTPUT_CSV=%s", csv_path, cleaned_path)
 
+    retrieved_code = _retrieve_similar_approved_code(metadata_json)
+    few_shot_block = ""
+    if retrieved_code:
+        few_shot_block = (
+            "Here is a highly rated, human-approved snippet for a similar dataset schema:\n"
+            f"{retrieved_code}\n"
+            "Adapt its logic into ONE function only: `def transform_data(df):` — no imports, no CSV I/O, "
+            "only in-memory `df` work and `return df`. If the snippet uses flat scripts or file I/O, rewrite it.\n\n"
+        )
+        logger.info("[Transform] Few-shot block attached from policy memory.")
+
+    critical_reject = ""
+    if rejection_feedback:
+        critical_reject = (
+            "CRITICAL: Your previous code was rejected. "
+            f"Human Feedback: {rejection_feedback}. "
+            "You MUST fix this in your new code.\n\n"
+        )
+
     if rejection_feedback:
         # ── Corrective prompt ──────────────────────────────────────────
         prompt = (
-            "You are an expert Data Engineer Python Agent. Write production-ready pandas "
-            "code that transforms the dataset according to reviewer feedback and schema hints.\n\n"
+            "You are an expert Data Engineer Python Agent. Implement transformations using pandas/numpy "
+            "according to reviewer feedback and the schema profile.\n\n"
+            f"{few_shot_block}"
+            f"{critical_reject}"
             f"{_GEMINI_TRANSFORM_RULES}\n\n"
             f"REJECTION FEEDBACK: \"{rejection_feedback}\"\n\n"
             "Dataset metadata profile (JSON):\n"
-            f"```json\n{metadata_json}\n```\n\n"
-            "Write a CORRECTED script that applies hygiene first, then directly addresses "
-            "the feedback with appropriate transformations for this schema.\n"
-            "Print a short summary line with final row count.\n"
+            f"{metadata_json}\n\n"
+            "Produce a CORRECTED `transform_data(df)` that applies hygiene first, then fixes the feedback "
+            "for this schema. You may use `print(...)` inside the function for a one-line row-count summary.\n"
         )
     else:
         # ── First-run prompt ───────────────────────────────────────────
         prompt = (
-            "You are an expert Data Engineer Python Agent. Write production-ready pandas "
-            "code to clean and transform the dataset described below.\n\n"
+            "You are an expert Data Engineer Python Agent. Implement cleaning and transformations with pandas/numpy "
+            "for the dataset described below.\n\n"
+            f"{few_shot_block}"
             f"{_GEMINI_TRANSFORM_RULES}\n\n"
             "Dataset metadata profile (JSON):\n"
-            f"```json\n{metadata_json}\n```\n\n"
-            "After hygiene, apply at least three meaningful transformations suited to this "
-            "schema (e.g. parse dates, coerce numerics, standardize strings, outliers).\n"
-            "Print a short summary line with final row count.\n"
+            f"{metadata_json}\n\n"
+            "After hygiene, apply at least three meaningful transformations suited to this schema "
+            "(e.g. parse dates, coerce numerics, standardize strings, handle outliers).\n"
+            "Output only `def transform_data(df):` as specified; you may `print` a one-line row-count summary inside it.\n"
         )
 
     generated_code = TRANSFORM_CODE_FALLBACK
@@ -433,21 +564,25 @@ def transform_node(state: PipelineState) -> PipelineState:
         model = _get_gemini()
         response = model.generate_content(prompt)
         raw = (response.text or "").strip()
-
-        # Strip any markdown fences the model emits despite instructions
-        raw = re.sub(r"^```(?:python)?\s*", "", raw, flags=re.IGNORECASE | re.MULTILINE)
-        raw = re.sub(r"\s*```\s*$", "", raw, flags=re.MULTILINE)
-        raw = raw.strip()
-
-        if raw:
-            generated_code = raw
-            logger.info("[Transform] Gemini code generated (%d chars)", len(raw))
+        normalized = _extract_transform_data_function(raw)
+        valid_fn = bool(
+            normalized
+            and re.search(r"^\s*def\s+transform_data\s*\(\s*df\s*\)\s*:", normalized, re.MULTILINE)
+        )
+        if valid_fn:
+            generated_code = normalized
+            logger.info("[Transform] Gemini code normalized (%d chars)", len(generated_code))
         else:
-            logger.warning("[Transform] Gemini returned empty — using fallback.")
+            if raw:
+                logger.warning(
+                    "[Transform] Model output missing valid `def transform_data(df):` — using fallback."
+                )
+            else:
+                logger.warning("[Transform] Gemini returned empty — using fallback.")
 
     except Exception as exc:
         logger.error("[Transform] Gemini error: %s", exc, exc_info=True)
-        generated_code = f"# ERROR: Gemini API failed — {exc}\n" + TRANSFORM_CODE_FALLBACK
+        generated_code = TRANSFORM_CODE_FALLBACK
 
     updated_state = {
         **state,
@@ -461,7 +596,7 @@ def transform_node(state: PipelineState) -> PipelineState:
         "message":          "Review the generated transformation code.",
         "generated_code":   generated_code,
         "healing_iteration": healing_iterations,
-        "action_required":  "Resume with 'Approve' or 'Reject:<feedback>' to continue.",
+        "action_required":  "Resume with 'Approve' or 'Reject: <feedback>'. Code must define transform_data(df) only.",
     })
 
     updated_state["human_feedback"] = human_decision
@@ -485,7 +620,7 @@ def healing_node(state: PipelineState) -> PipelineState:
     iterations = state.get("healing_iterations", 0)
 
     if feedback.lower().startswith("reject"):
-        # Extract user's textual feedback from "Reject:<message>"
+        # Extract user's textual feedback from "Reject: <message>"
         parts = feedback.split(":", 1)
         rejection_text = parts[1].strip() if len(parts) > 1 and parts[1].strip() \
             else "The generated code needs improvement — please review and fix issues."
@@ -559,13 +694,14 @@ def _should_loop_back(state: PipelineState) -> str:
 # ---------------------------------------------------------------------------
 
 def orchestrator_node(state: PipelineState) -> PipelineState:
-    """Persist the approved code to ChromaDB for RLHF knowledge storage.
+    """Persist approved transform policy to ChromaDB (`approved_transforms`).
 
-    Code EXECUTION is handled externally by the FastAPI /approve endpoint via
-    the multiprocessing sandbox before this node is reached.
+    Document body = dataset metadata JSON (`input_data`); metadata holds the
+    approved/edited code and a UNIX timestamp. Code execution is done in FastAPI
+    `/approve` before this node runs.
     """
     feedback = (state.get("human_feedback") or "").strip().lower()
-    logger.info("[Orchestrator] Processing — feedback: %s", feedback[:40])
+    logger.info("[Orchestrator] Processing — human_feedback prefix: %s", feedback[:48])
 
     if feedback.startswith("reject"):
         # Max iterations hit — record as rejected
@@ -577,50 +713,72 @@ def orchestrator_node(state: PipelineState) -> PipelineState:
             ),
         }
 
-    # ── Approved → persist to ChromaDB ────────────────────────────────
+    # ── Approved → persist schema + code to ChromaDB ─────────────────
+    schema_doc = (state.get("input_data") or "").strip()
+    code_body = (state.get("edited_code") or state.get("generated_code") or "").strip()
+    csv_path = state.get("active_csv_path") or CSV_PATH
+    cleaned_path = _derive_cleaned_path(csv_path)
+    csv_ready = os.path.isfile(cleaned_path)
+
+    if not schema_doc:
+        logger.warning("[Orchestrator] Missing input_data — skipping Chroma persist.")
+        return {
+            **state,
+            "status": (
+                f"Pipeline Complete. {os.path.basename(cleaned_path)} "
+                f"{'ready ✓' if csv_ready else 'pending ✗'}."
+            ),
+        }
+
+    if not code_body:
+        logger.warning("[Orchestrator] No code to persist (edited/generated empty) — skipping Chroma add.")
+        return {
+            **state,
+            "status": (
+                f"Pipeline Complete. {os.path.basename(cleaned_path)} "
+                f"{'ready ✓' if csv_ready else 'pending ✗'}."
+            ),
+        }
+
+    ts = str(int(time.time()))
+    entry_id = f"approved_{uuid.uuid4().hex}"
+
     try:
-        import chromadb  # type: ignore
-
-        chroma_path = os.path.join(_BACKEND_DIR, "chroma_db")
-        client      = chromadb.PersistentClient(path=chroma_path)
-        collection  = client.get_or_create_collection(
-            name="rlhf_pipeline_knowledge",
-            metadata={"description": "Approved pipeline code for RLHF"},
-        )
-
-        code         = (state.get("edited_code") or state.get("generated_code") or "")
-        csv_path     = state.get("active_csv_path") or CSV_PATH
-        cleaned_path = _derive_cleaned_path(csv_path)
-        csv_ready    = os.path.isfile(cleaned_path)
-
-        import time
+        collection = _get_approved_transforms_collection()
         collection.add(
-            documents=[code],
-            ids=[f"pipeline_code_{hash(code) & 0xFFFFFFFF}"],
+            ids=[entry_id],
+            documents=[schema_doc],
             metadatas=[{
-                "feedback":          state.get("human_feedback", ""),
-                "status":            "approved",
-                "source":            "transform_agent_gemini_v3",
-                "source_file":       os.path.basename(csv_path),
-                "healing_iters":     str(state.get("healing_iterations", 0)),
-                "timestamp":         str(int(time.time())),
+                "approved_code":   code_body,
+                "timestamp":       ts,
+                "source_file":     os.path.basename(csv_path),
+                "human_feedback":  state.get("human_feedback") or "",
+                "healing_iters":   str(state.get("healing_iterations", 0)),
             }],
         )
-
-        doc_count  = collection.count()
+        doc_count = collection.count()
         status_msg = (
             f"Pipeline Complete. {os.path.basename(cleaned_path)} "
             f"{'ready ✓' if csv_ready else 'pending ✗'}. "
-            f"ChromaDB: {doc_count} approved scripts stored."
+            f"ChromaDB `{_APPROVED_TRANSFORMS_COLLECTION}`: {doc_count} entries."
         )
-        logger.info("[Orchestrator] ChromaDB updated (docs=%d, csv_ready=%s)", doc_count, csv_ready)
+        logger.info(
+            "[Orchestrator] Saved approved transform id=%s ts=%s (collection_size=%d)",
+            entry_id,
+            ts,
+            doc_count,
+        )
         return {**state, "status": status_msg}
 
     except Exception as exc:
-        logger.error("[Orchestrator] ChromaDB error: %s", exc, exc_info=True)
+        logger.error("[Orchestrator] ChromaDB persist failed: %s", exc, exc_info=True)
         return {
             **state,
-            "status": f"Pipeline Complete (ChromaDB error: {exc}).",
+            "status": (
+                f"Pipeline Complete. {os.path.basename(cleaned_path)} "
+                f"{'ready ✓' if csv_ready else 'pending ✗'} "
+                f"(ChromaDB error: {exc})."
+            ),
         }
 
 
@@ -656,7 +814,23 @@ def build_graph() -> StateGraph:
     )
     builder.add_edge("orchestrator", END)
 
-    checkpointer = MemorySaver()
+    checkpoint_path = os.path.join(_BACKEND_DIR, "checkpoints.db")
+    try:
+        conn = sqlite3.connect(checkpoint_path, check_same_thread=False)
+        checkpointer = SqliteSaver(conn)
+        logger.info(
+            "[Checkpoint] SqliteSaver attached (%s)",
+            os.path.abspath(checkpoint_path),
+        )
+    except Exception as exc:
+        logger.error(
+            "[Checkpoint] Failed to open %s: %s",
+            checkpoint_path,
+            exc,
+            exc_info=True,
+        )
+        raise
+
     compiled = builder.compile(checkpointer=checkpointer)
     logger.info(
         "Pipeline graph compiled v3 (healing loop, ydata-profiling, dynamic CSV)."

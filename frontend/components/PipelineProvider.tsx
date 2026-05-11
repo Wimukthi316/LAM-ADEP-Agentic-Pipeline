@@ -6,11 +6,15 @@ import React, {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import axios from "axios";
 import ToastContainer, { useToast } from "@/components/Toast";
-import type { DailySalesPoint } from "@/components/AnalyticsChart";
+import type {
+  DailyChartSeries,
+  DailySeriesPoint,
+} from "@/components/AnalyticsChart";
 import { API_BASE } from "@/lib/api";
 import {
   DEFAULT_PIPELINE_UI,
@@ -53,11 +57,9 @@ interface PipelineContextValue {
   analyticsLoading: boolean;
   analyticsError: string | null;
   analyticsSnapshot: {
-    row_count: number;
-    avg_unit_price: number;
-    sum_gross_income: number;
-    sum_total_sales: number;
-    daily_sales: DailySalesPoint[];
+    metrics: { label: string; value: number }[];
+    daily_sales: DailySeriesPoint[];
+    daily_series: DailyChartSeries[];
     dataset_file: string | null;
   } | null;
   memoryItems: MemoryItem[];
@@ -174,6 +176,8 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(false);
   const [approving, setApproving] = useState(false);
   const [rejecting, setRejecting] = useState(false);
+  /** Prevents /status polling from overwriting optimistic "running" UI during POST /reject. */
+  const rejectingInFlightRef = useRef(false);
   const [downloading, setDownloading] = useState(false);
 
   const csvFilename = useMemo(() => {
@@ -187,11 +191,9 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
   const [analyticsLoading, setAnalyticsLoading] = useState(true);
   const [analyticsError, setAnalyticsError] = useState<string | null>(null);
   const [analyticsSnapshot, setAnalyticsSnapshot] = useState<{
-    row_count: number;
-    avg_unit_price: number;
-    sum_gross_income: number;
-    sum_total_sales: number;
-    daily_sales: DailySalesPoint[];
+    metrics: { label: string; value: number }[];
+    daily_sales: DailySeriesPoint[];
+    daily_series: DailyChartSeries[];
     dataset_file: string | null;
   } | null>(null);
   const [memoryItems, setMemoryItems] = useState<MemoryItem[]>([]);
@@ -217,9 +219,13 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
       try {
         const res = await axios.get(`${API_BASE}/status`);
         if (res.data && typeof res.data === "object") {
-          setPipeline((prev) =>
-            mergePollIntoPipelineState(res.data as Record<string, unknown>, prev)
-          );
+          setPipeline((prev) => {
+            if (rejectingInFlightRef.current) return prev;
+            return mergePollIntoPipelineState(
+              res.data as Record<string, unknown>,
+              prev
+            );
+          });
         }
       } catch {
         /* ignore poll errors */
@@ -277,23 +283,45 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
         return;
       }
       setAnalyticsError(null);
+      const metricsRaw = Array.isArray(d.metrics) ? d.metrics : [];
+      let metrics: { label: string; value: number }[] = metricsRaw.map(
+        (m) => {
+          const x = m as Record<string, unknown>;
+          return {
+            label: typeof x.label === "string" ? x.label : "Metric",
+            value: typeof x.value === "number" ? x.value : Number(x.value) || 0,
+          };
+        }
+      );
+      if (!metrics.length) {
+        metrics = [{ label: "Total Rows", value: 0 }];
+      }
       const dailyRaw = Array.isArray(d.daily_sales) ? d.daily_sales : [];
-      const daily_sales: DailySalesPoint[] = dailyRaw.map((p) => {
+      const daily_sales: DailySeriesPoint[] = dailyRaw.map((p) => {
         const x = p as Record<string, unknown>;
-        return {
+        const pt: DailySeriesPoint = {
           date: typeof x.date === "string" ? x.date : "",
           label: typeof x.label === "string" ? x.label : "",
-          total_sales: Number(x.total_sales) || 0,
-          gross_income: Number(x.gross_income) || 0,
+        };
+        for (const [k, v] of Object.entries(x)) {
+          if (k === "date" || k === "label") continue;
+          pt[k] = typeof v === "number" ? v : Number(v) || 0;
+        }
+        return pt;
+      });
+      const seriesRaw = Array.isArray(d.daily_series) ? d.daily_series : [];
+      const daily_series: DailyChartSeries[] = seriesRaw.map((s) => {
+        const x = s as Record<string, unknown>;
+        return {
+          key: typeof x.key === "string" ? x.key : "",
+          label: typeof x.label === "string" ? x.label : "",
         };
       });
       const dsFile = d.dataset_file;
       setAnalyticsSnapshot({
-        row_count: Number(d.row_count) || 0,
-        avg_unit_price: Number(d.avg_unit_price) || 0,
-        sum_gross_income: Number(d.sum_gross_income) || 0,
-        sum_total_sales: Number(d.sum_total_sales) || 0,
+        metrics,
         daily_sales,
+        daily_series,
         dataset_file: typeof dsFile === "string" ? dsFile : null,
       });
     } catch {
@@ -448,7 +476,10 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
         paused ? "Regenerated" : "Approved",
         typeof data.message === "string" ? data.message : "OK"
       );
-      if (!paused) void refreshAnalytics();
+      if (!paused) {
+        void refreshAnalytics();
+        void refreshMemory();
+      }
     } catch (err: unknown) {
       let msg = "Backend request failed.";
       if (axios.isAxiosError(err) && err.response?.data)
@@ -457,7 +488,7 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
     } finally {
       setApproving(false);
     }
-  }, [addToast, editedCode, pipeline.thread_id, refreshAnalytics]);
+  }, [addToast, editedCode, pipeline.thread_id, refreshAnalytics, refreshMemory]);
 
   const rejectPipeline = useCallback(
     async (feedback: string) => {
@@ -465,15 +496,47 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
         addToast("warning", "No Thread", "Start the pipeline first.");
         return;
       }
+      const tid = pipeline.thread_id;
+      rejectingInFlightRef.current = true;
       setRejecting(true);
+      setPipeline((prev) => ({
+        ...prev,
+        status: "running",
+        current_stage: "transform",
+        message: "Regenerating code after rejection…",
+      }));
       try {
         const res = await axios.post(`${API_BASE}/reject`, {
-          thread_id: pipeline.thread_id,
-          feedback: feedback.trim(),
+          thread_id: tid,
+          feedback_text: feedback.trim(),
         });
         const data = res.data as Record<string, unknown>;
         if (data.success === false) {
           addToast("error", "Reject Failed", apiErrorDetail(data));
+          try {
+            const tRes = await axios.get(`${API_BASE}/state/${tid}`);
+            const tData = tRes.data as Record<string, unknown>;
+            if (
+              tData.success !== false &&
+              tData.paused === true &&
+              tData.state &&
+              typeof tData.state === "object"
+            ) {
+              const ui = pausedStateToPipelineUI(
+                tData.state as Record<string, unknown>,
+                tid
+              );
+              setPipeline((prev) => ({ ...prev, ...ui }));
+              if (
+                typeof ui.generated_code === "string" &&
+                ui.generated_code.trim()
+              ) {
+                setEditedCode(ui.generated_code);
+              }
+            }
+          } catch {
+            /* keep optimistic rollback partial */
+          }
           return;
         }
         const ui = apiResponseToPipelineUI(data, true);
@@ -493,7 +556,32 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
         if (axios.isAxiosError(err) && err.response?.data)
           msg = apiErrorDetail(err.response.data);
         addToast("error", "Reject Failed", msg);
+        try {
+          const tRes = await axios.get(`${API_BASE}/state/${tid}`);
+          const tData = tRes.data as Record<string, unknown>;
+          if (
+            tData.success !== false &&
+            tData.paused === true &&
+            tData.state &&
+            typeof tData.state === "object"
+          ) {
+            const ui = pausedStateToPipelineUI(
+              tData.state as Record<string, unknown>,
+              tid
+            );
+            setPipeline((prev) => ({ ...prev, ...ui }));
+            if (
+              typeof ui.generated_code === "string" &&
+              ui.generated_code.trim()
+            ) {
+              setEditedCode(ui.generated_code);
+            }
+          }
+        } catch {
+          /* ignore */
+        }
       } finally {
+        rejectingInFlightRef.current = false;
         setRejecting(false);
       }
     },
