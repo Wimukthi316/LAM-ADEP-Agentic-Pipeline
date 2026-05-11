@@ -1,14 +1,38 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import {
   CheckCircle2,
   XCircle,
   Loader2,
   ShieldCheck,
+  Mic,
 } from "lucide-react";
 import { usePipeline } from "@/components/PipelineProvider";
+
+/** Minimal Web Speech API surface (DOM lib types vary by TS `lib` config). */
+type WebSpeechRecognition = {
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  onresult: ((event: { resultIndex: number; results: unknown }) => void) | null;
+  onerror: (() => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+};
+
+type SpeechRecognitionCtor = new () => WebSpeechRecognition;
+
+function getSpeechRecognitionCtor(): SpeechRecognitionCtor | null {
+  if (typeof window === "undefined") return null;
+  const w = window as unknown as {
+    SpeechRecognition?: SpeechRecognitionCtor;
+    webkitSpeechRecognition?: SpeechRecognitionCtor;
+  };
+  return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
+}
 
 const MonacoEditor = dynamic(() => import("@monaco-editor/react"), {
   ssr: false,
@@ -25,10 +49,13 @@ export default function HitlPage() {
     rejectPipeline,
     downloadCleanedCsv,
     downloading,
+    addToast,
   } = usePipeline();
 
   const [showReject, setShowReject] = useState(false);
   const [feedback, setFeedback] = useState("");
+  const [voiceListening, setVoiceListening] = useState(false);
+  const recognitionRef = useRef<WebSpeechRecognition | null>(null);
 
   const isPaused = pipeline.status === "paused";
   const isCompleted = pipeline.status === "completed";
@@ -36,7 +63,84 @@ export default function HitlPage() {
     rejecting || (pipeline.status === "running" && Boolean(pipeline.thread_id));
   const codeForEditor = editedCode.trim() ? editedCode : pipeline.generated_code;
 
+  const stopRecognitionHardware = useCallback(() => {
+    try {
+      recognitionRef.current?.stop();
+    } catch {
+      /* ignore */
+    }
+    recognitionRef.current = null;
+  }, []);
+
+  const stopVoice = useCallback(() => {
+    stopRecognitionHardware();
+    setVoiceListening(false);
+  }, [stopRecognitionHardware]);
+
+  const closeRejectModal = useCallback(() => {
+    stopRecognitionHardware();
+    setVoiceListening(false);
+    setShowReject(false);
+  }, [stopRecognitionHardware]);
+
+  const startVoiceFeedback = useCallback(() => {
+    const Ctor = getSpeechRecognitionCtor();
+    if (!Ctor) {
+      addToast(
+        "warning",
+        "Voice unavailable",
+        "Speech recognition is not supported in this browser (try Chrome / Edge)."
+      );
+      return;
+    }
+    stopVoice();
+    setShowReject(true);
+    let rec: WebSpeechRecognition;
+    try {
+      rec = new Ctor();
+    } catch {
+      addToast("error", "Voice", "Could not start speech recognition.");
+      return;
+    }
+    rec.lang = typeof navigator !== "undefined" ? navigator.language : "en-US";
+    rec.continuous = false;
+    rec.interimResults = true;
+    rec.onresult = (event: { resultIndex: number; results: unknown }) => {
+      const results = event.results as {
+        length: number;
+        [i: number]: { [j: number]: { transcript: string } };
+      };
+      let chunk = "";
+      for (let i = event.resultIndex; i < results.length; i++) {
+        chunk += results[i]![0]!.transcript;
+      }
+      chunk = chunk.trim();
+      if (!chunk) return;
+      setFeedback((prev) => (prev ? `${prev} ${chunk}`.trim() : chunk));
+    };
+    rec.onerror = () => {
+      setVoiceListening(false);
+      recognitionRef.current = null;
+    };
+    rec.onend = () => {
+      setVoiceListening(false);
+      recognitionRef.current = null;
+    };
+    recognitionRef.current = rec;
+    setVoiceListening(true);
+    try {
+      rec.start();
+    } catch {
+      setVoiceListening(false);
+      recognitionRef.current = null;
+      addToast("error", "Voice", "Could not start the microphone listener.");
+    }
+  }, [addToast, stopVoice]);
+
+  useEffect(() => () => stopRecognitionHardware(), [stopRecognitionHardware]);
+
   const submitReject = async () => {
+    stopVoice();
     await rejectPipeline(feedback || "Please improve this transformation.");
     setShowReject(false);
     setFeedback("");
@@ -107,15 +211,15 @@ export default function HitlPage() {
           </button>
         ) : null}
 
-        <div className="flex gap-3">
+        <div className="flex flex-wrap gap-2">
           <button
             type="button"
             onClick={() => void approvePipeline()}
             disabled={!isPaused || approving || isRegenerating}
-            className={`flex-1 py-2.5 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5
+            className={`flex-1 min-w-[120px] py-2.5 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5
                     ${
                       isPaused && !approving && !isRegenerating
-                        ? "bg-gradient-to-r from-emerald-500 to-teal-600 text-white"
+                        ? "bg-gradient-to-r from-emerald-500 to-teal-600 text-white shadow-lg shadow-emerald-500/15"
                         : "bg-[#1c2333] text-gray-600 cursor-not-allowed"
                     }`}
           >
@@ -130,15 +234,36 @@ export default function HitlPage() {
             type="button"
             onClick={() => setShowReject(true)}
             disabled={!isPaused || rejecting || isRegenerating}
-            className={`flex-1 py-2.5 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5
+            className={`flex-1 min-w-[120px] py-2.5 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5
                     ${
                       isPaused && !rejecting && !isRegenerating
-                        ? "bg-gradient-to-r from-rose-500 to-pink-600 text-white"
+                        ? "bg-gradient-to-r from-rose-500 to-pink-600 text-white shadow-lg shadow-rose-500/15"
                         : "bg-[#1c2333] text-gray-600 cursor-not-allowed"
                     }`}
           >
             <XCircle size={13} />
             Reject
+          </button>
+          <button
+            type="button"
+            onClick={() => startVoiceFeedback()}
+            disabled={!isPaused || approving || rejecting || isRegenerating}
+            title="Speak your rejection feedback (opens feedback panel)"
+            className={`shrink-0 min-w-[132px] py-2.5 px-3 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 border transition-all
+                    ${
+                      isPaused && !approving && !rejecting && !isRegenerating
+                        ? voiceListening
+                          ? "border-amber-400/60 bg-amber-500/15 text-amber-200 shadow-[0_0_20px_-4px_rgba(251,191,36,0.45)]"
+                          : "border-amber-500/35 bg-[#0a0d14] text-amber-200/90 hover:bg-amber-500/10 hover:border-amber-400/50"
+                        : "border-[#1c2333] text-gray-600 cursor-not-allowed"
+                    }`}
+          >
+            {voiceListening ? (
+              <Loader2 size={13} className="animate-spin text-amber-300" />
+            ) : (
+              <Mic size={13} className="text-amber-400/90" />
+            )}
+            Voice feedback
           </button>
         </div>
       </div>
@@ -193,7 +318,13 @@ export default function HitlPage() {
       )}
 
       {showReject && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
+        <div
+          className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm"
+          role="presentation"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) closeRejectModal();
+          }}
+        >
           <div className="glass-card max-w-lg w-full p-6 border border-[#1c2333]">
             <h3 className="text-sm font-semibold text-white mb-2">
               Rejection feedback
@@ -203,18 +334,24 @@ export default function HitlPage() {
               <code className="text-gray-400">rejection_feedback</code>. Healing
               round {Math.min(pipeline.healing_iterations + 1, 3)} of 3.
             </p>
+            {voiceListening ? (
+              <p className="text-[10px] text-amber-400/90 mb-2 flex items-center gap-1.5">
+                <span className="inline-flex h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse" />
+                Listening… speak clearly; text appears below. Click again from the bar to re-run.
+              </p>
+            ) : null}
             <textarea
               value={feedback}
               onChange={(e) => setFeedback(e.target.value)}
               rows={5}
               className="w-full rounded-xl bg-[#0a0d14] border border-[#1c2333] text-sm p-3 text-gray-200 focus:outline-none focus:ring-1 focus:ring-cyan-500/50"
-              placeholder="e.g. Preserve column X as string, do not drop nulls in Y…"
+              placeholder="e.g. Preserve column X as string, do not drop nulls in Y… (or use Voice feedback)"
             />
             <div className="flex justify-end gap-2 mt-4">
               <button
                 type="button"
                 className="px-4 py-2 rounded-xl text-xs text-gray-400 border border-[#1c2333]"
-                onClick={() => setShowReject(false)}
+                onClick={() => closeRejectModal()}
               >
                 Cancel
               </button>

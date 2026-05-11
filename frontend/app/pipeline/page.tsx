@@ -13,7 +13,7 @@ import PipelineFlowGraph from "@/components/PipelineFlowGraph";
 import DatasetUpload from "@/components/DatasetUpload";
 import { usePipeline } from "@/components/PipelineProvider";
 import {
-  STAGES,
+  orderedStagesForRun,
   buildNodes,
   buildEdges,
   getNodeStatus,
@@ -30,8 +30,24 @@ export default function PipelinePage() {
     reset,
   } = usePipeline();
 
-  const nodes = useMemo(() => buildNodes(pipeline), [pipeline]);
-  const edges = useMemo(() => buildEdges(pipeline), [pipeline]);
+  /** Before the first run, reflect WAV/MP3 selection in the DAG preview. */
+  const dagState = useMemo(() => {
+    const name =
+      pendingDatasetFile?.name ??
+      (inputCsvPath ? inputCsvPath.replace(/\\/g, "/").split("/").pop() ?? "" : "");
+    const looksAudio = /\.(wav|mp3)$/i.test(name);
+    if (pipeline.status === "idle" && looksAudio) {
+      return { ...pipeline, pipeline_kind: "audio" as const };
+    }
+    return pipeline;
+  }, [pipeline, pendingDatasetFile, inputCsvPath]);
+
+  const nodes = useMemo(() => buildNodes(dagState), [dagState]);
+  const edges = useMemo(() => buildEdges(dagState), [dagState]);
+  const stageList = useMemo(
+    () => orderedStagesForRun(dagState.pipeline_kind),
+    [dagState.pipeline_kind]
+  );
 
   const isPaused = pipeline.status === "paused";
   const isRunning = pipeline.status === "running";
@@ -44,10 +60,10 @@ export default function PipelinePage() {
       <section>
         <h2 className="text-lg font-semibold text-white">Dataset</h2>
         <p className="text-[11px] text-gray-500 mt-1 mb-4">
-          Select a CSV, then click Start — the client POSTs to{" "}
-          <code className="text-gray-400">/upload</code> then{" "}
+          CSV → <code className="text-gray-400">/upload</code> +{" "}
           <code className="text-gray-400">/start</code> with{" "}
-          <code className="text-gray-400">input_csv_path</code>.
+          <code className="text-gray-400">input_csv_path</code>. WAV/MP3 → same upload, then{" "}
+          <code className="text-gray-400">audio_path</code> on start.
         </p>
         <DatasetUpload />
       </section>
@@ -86,7 +102,7 @@ export default function PipelinePage() {
             <>
               <Loader2 size={16} className="animate-spin" />
               {startPhase === "uploading"
-                ? "Uploading CSV…"
+                ? "Uploading file…"
                 : startPhase === "starting"
                   ? "Starting pipeline…"
                   : "Working…"}
@@ -114,10 +130,19 @@ export default function PipelinePage() {
           <div>
             <h2 className="text-sm font-semibold text-white">Pipeline DAG</h2>
             <p className="text-[11px] text-gray-500 mt-0.5">
-              LangGraph v3 — dashed edge: healing → transform on reject (max 3)
+              Tabular: Start → Discovery → Transform. Audio: Start → Audio prep → Transform. Dashed edge
+              = healing → transform on reject (max 3).
             </p>
           </div>
-          <div className="flex items-center gap-3 text-[10px] text-gray-500">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-gray-500">
+            <span className="flex items-center gap-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+              ML
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-purple-400" />
+              Gemini
+            </span>
             <span className="flex items-center gap-1">
               <span className="w-1.5 h-1.5 rounded-full bg-gray-600" />
               Idle
@@ -127,7 +152,7 @@ export default function PipelinePage() {
               Running
             </span>
             <span className="flex items-center gap-1">
-              <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+              <span className="w-1.5 h-1.5 rounded-full bg-violet-400" />
               Paused
             </span>
             <span className="flex items-center gap-1">
@@ -144,8 +169,8 @@ export default function PipelinePage() {
           Execution log
         </h3>
         <div className="space-y-3">
-          {STAGES.map((stage) => {
-            const status = getNodeStatus(stage, pipeline);
+          {stageList.map((stage, idx) => {
+            const status = getNodeStatus(stage, dagState);
             return (
               <div key={stage} className="flex items-center gap-3 text-xs">
                 <div
@@ -169,7 +194,7 @@ export default function PipelinePage() {
                   ) : status === "failed" ? (
                     <XCircle size={12} />
                   ) : (
-                    STAGES.indexOf(stage) + 1
+                    idx + 1
                   )}
                 </div>
                 <span
@@ -181,7 +206,9 @@ export default function PipelinePage() {
                         : "text-gray-600"
                   }
                 >
-                  {stage.charAt(0).toUpperCase() + stage.slice(1)}
+                  {stage === "audio_preprocessing"
+                    ? "Audio preprocessing"
+                    : stage.charAt(0).toUpperCase() + stage.slice(1)}
                 </span>
                 {status === "paused" && (
                   <span className="ml-auto text-[10px] text-amber-400 animate-pulse flex items-center gap-1">

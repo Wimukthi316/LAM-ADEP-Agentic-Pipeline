@@ -1,7 +1,16 @@
 import type { Node, Edge } from "reactflow";
 import type { NodeStatus } from "@/components/PipelineNode";
 
-export const STAGES = ["discovery", "transform", "healing", "orchestrator"] as const;
+/** All node ids that may appear in the React Flow DAG (tabular uses discovery; audio uses audio_preprocessing). */
+export const STAGES = [
+  "discovery",
+  "audio_preprocessing",
+  "transform",
+  "healing",
+  "orchestrator",
+] as const;
+
+export type PipelineKind = "tabular" | "audio";
 
 export type PipelineRunStatus =
   | "idle"
@@ -18,17 +27,46 @@ export interface PipelineUIState {
   stages_completed: string[];
   generated_code: string;
   healing_iterations: number;
+  /** Which entry branch the UI + DAG reflect (CSV discovery vs audio preprocessing). */
+  pipeline_kind: PipelineKind;
 }
 
 export const DEFAULT_PIPELINE_UI: PipelineUIState = {
   status: "idle",
   current_stage: "",
   thread_id: null,
-  message: "Pipeline ready. Start from the Pipeline page after uploading a CSV.",
+  message:
+    "Pipeline ready. Upload tabular data (CSV) or audio (WAV/MP3), then start from the Pipeline page.",
   stages_completed: [],
   generated_code: "",
   healing_iterations: 0,
+  pipeline_kind: "tabular",
 };
+
+/** Ordered stages for the execution log / status chips for the active modality. */
+export function orderedStagesForRun(kind: PipelineKind): string[] {
+  if (kind === "audio") {
+    return ["audio_preprocessing", "transform", "healing", "orchestrator"];
+  }
+  return ["discovery", "transform", "healing", "orchestrator"];
+}
+
+export function inferPipelineKindFromState(st: Record<string, unknown>): PipelineKind {
+  const ap = st.audio_path;
+  if (typeof ap === "string" && ap.trim()) {
+    return "audio";
+  }
+  const rawInput = st.input_data;
+  if (typeof rawInput === "string" && rawInput.trim()) {
+    try {
+      const j = JSON.parse(rawInput) as { modality?: string };
+      if (j?.modality === "audio") return "audio";
+    } catch {
+      /* ignore */
+    }
+  }
+  return "tabular";
+}
 
 export function uiStatusFromBackend(
   raw: unknown
@@ -54,6 +92,16 @@ export function mergePollIntoPipelineState(
         ? parseInt(healingRaw, 10) || prev.healing_iterations
         : prev.healing_iterations;
 
+  const nextStages = Array.isArray(raw.stages_completed)
+    ? (raw.stages_completed as string[])
+    : prev.stages_completed;
+  let nextKind: PipelineKind = prev.pipeline_kind;
+  if (nextStages.includes("audio_preprocessing")) nextKind = "audio";
+  else if (nextStages.includes("discovery")) nextKind = "tabular";
+  if (typeof raw.pipeline_kind === "string" && raw.pipeline_kind === "audio") {
+    nextKind = "audio";
+  }
+
   return {
     ...prev,
     status,
@@ -64,14 +112,13 @@ export function mergePollIntoPipelineState(
     thread_id:
       typeof raw.thread_id === "string" ? raw.thread_id : prev.thread_id,
     message: typeof raw.message === "string" ? raw.message : prev.message,
-    stages_completed: Array.isArray(raw.stages_completed)
-      ? (raw.stages_completed as string[])
-      : prev.stages_completed,
+    stages_completed: nextStages,
     generated_code:
       typeof raw.generated_code === "string"
         ? raw.generated_code
         : prev.generated_code,
     healing_iterations,
+    pipeline_kind: nextKind,
   };
 }
 
@@ -97,8 +144,12 @@ export function getNodeStatus(
 }
 
 export function buildNodes(pipelineState: PipelineUIState): Node[] {
+  const kind = pipelineState.pipeline_kind;
+  const chain = orderedStagesForRun(kind);
+
   const descriptions: Record<string, string> = {
-    discovery: "ydata-profiling discovery (≤6 KB JSON)",
+    discovery: "ydata-profiling → compact JSON (tabular)",
+    audio_preprocessing: "MFCC + neuro-symbolic classifier + Whisper",
     transform: "Gemini 2.5 Flash + HITL gate",
     healing: "Reject routing & corrective loop (max 3)",
     orchestrator: "ChromaDB RLHF persistence",
@@ -106,42 +157,59 @@ export function buildNodes(pipelineState: PipelineUIState): Node[] {
 
   const icons: Record<string, string> = {
     discovery: "search",
+    audio_preprocessing: "audio",
     transform: "shuffle",
     healing: "heartpulse",
     orchestrator: "brain",
   };
 
-  return STAGES.map((stage, i) => ({
+  /** ML / local models: amber; Gemini: purple; healing: cyan routing; memory: amber. */
+  const nodeTheme: Record<string, "ml" | "gemini" | "routing" | "memory"> = {
+    discovery: "ml",
+    audio_preprocessing: "ml",
+    transform: "gemini",
+    healing: "routing",
+    orchestrator: "memory",
+  };
+
+  const labels: Record<string, string> = {
+    discovery: "Discovery",
+    audio_preprocessing: "Audio prep",
+    transform: "Transform",
+    healing: "Healing",
+    orchestrator: "Orchestrator",
+  };
+
+  return chain.map((stage, i) => ({
     id: stage,
     type: "pipeline",
     position: { x: i * 260, y: 60 },
     data: {
-      label:
-        stage === "orchestrator"
-          ? "Orchestrator"
-          : stage.charAt(0).toUpperCase() + stage.slice(1),
-      icon: icons[stage],
+      label: labels[stage] ?? stage,
+      icon: icons[stage] ?? "brain",
+      nodeTheme: nodeTheme[stage] ?? "ml",
       status: getNodeStatus(stage, pipelineState),
-      description: descriptions[stage],
+      description: descriptions[stage] ?? "",
     },
     draggable: false,
   }));
 }
 
-/** LangGraph v3 topology: healing may loop back to transform on reject. */
+/** LangGraph topology: entry → transform → healing → orchestrator; healing may loop to transform. */
 export function buildEdges(pipelineState: PipelineUIState): Edge[] {
+  const kind = pipelineState.pipeline_kind;
+  const entry = kind === "audio" ? "audio_preprocessing" : "discovery";
+  const entryDone = pipelineState.stages_completed.includes(entry);
+  const entryActive = pipelineState.current_stage === entry;
+
   const forward: Edge[] = [
     {
-      id: "discovery-transform",
-      source: "discovery",
+      id: `${entry}-transform`,
+      source: entry,
       target: "transform",
-      animated:
-        pipelineState.stages_completed.includes("discovery") ||
-        pipelineState.current_stage === "discovery",
+      animated: entryDone || entryActive,
       style: {
-        stroke: pipelineState.stages_completed.includes("discovery")
-          ? "#34d399"
-          : "#384868",
+        stroke: entryDone ? "#34d399" : "#384868",
         strokeWidth: 2,
       },
     },

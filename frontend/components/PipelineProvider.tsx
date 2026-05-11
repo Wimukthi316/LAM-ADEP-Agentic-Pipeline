@@ -18,7 +18,9 @@ import type {
 import { API_BASE } from "@/lib/api";
 import {
   DEFAULT_PIPELINE_UI,
+  inferPipelineKindFromState,
   mergePollIntoPipelineState,
+  orderedStagesForRun,
   type PipelineUIState,
 } from "@/lib/pipelineDag";
 
@@ -101,7 +103,14 @@ function apiResponseToPipelineUI(
         ? parseInt(hit, 10) || 0
         : 0;
 
+  const kind = inferPipelineKindFromState(st);
+  const defaultEntry =
+    kind === "audio" ? "audio_preprocessing" : "discovery";
+
   if (paused) {
+    const stagesFromState = Array.isArray(st.stages_completed)
+      ? (st.stages_completed as string[])
+      : [defaultEntry];
     return {
       status: "paused",
       current_stage: "transform",
@@ -111,11 +120,17 @@ function apiResponseToPipelineUI(
         typeof data.message === "string"
           ? data.message
           : "Paused for human review.",
-      stages_completed: ["discovery"],
+      stages_completed: stagesFromState.length ? stagesFromState : [defaultEntry],
       generated_code: generated,
       healing_iterations,
+      pipeline_kind: kind,
     };
   }
+
+  const fullDone =
+    Array.isArray(st.stages_completed) && st.stages_completed.length > 0
+      ? (st.stages_completed as string[])
+      : orderedStagesForRun(kind);
 
   return {
     status: "completed",
@@ -126,14 +141,10 @@ function apiResponseToPipelineUI(
       typeof data.message === "string"
         ? data.message
         : "Pipeline complete.",
-    stages_completed: [
-      "discovery",
-      "transform",
-      "healing",
-      "orchestrator",
-    ],
+    stages_completed: fullDone,
     generated_code: generated,
     healing_iterations,
+    pipeline_kind: kind,
   };
 }
 
@@ -150,6 +161,12 @@ function pausedStateToPipelineUI(
       : typeof hit === "string"
         ? parseInt(hit, 10) || 0
         : 0;
+  const kind = inferPipelineKindFromState(state);
+  const defaultEntry =
+    kind === "audio" ? "audio_preprocessing" : "discovery";
+  const stagesFromState = Array.isArray(state.stages_completed)
+    ? (state.stages_completed as string[])
+    : [defaultEntry];
   return {
     status: "paused",
     current_stage: "transform",
@@ -158,9 +175,10 @@ function pausedStateToPipelineUI(
       typeof state.status === "string"
         ? state.status
         : "Paused for human review.",
-    stages_completed: ["discovery"],
+    stages_completed: stagesFromState.length ? stagesFromState : [defaultEntry],
     generated_code: generated,
     healing_iterations,
+    pipeline_kind: kind,
   };
 }
 
@@ -209,8 +227,11 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
   }, [pipeline.thread_id]);
 
   useEffect(() => {
-    if (isPaused && pipeline.generated_code)
-      setEditedCode(pipeline.generated_code);
+    if (!isPaused || !pipeline.generated_code) return;
+    const code = pipeline.generated_code;
+    queueMicrotask(() => {
+      setEditedCode(code);
+    });
   }, [isPaused, pipeline.generated_code]);
 
   useEffect(() => {
@@ -335,7 +356,9 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
   }, [csvFilename]);
 
   useEffect(() => {
-    void refreshAnalytics();
+    queueMicrotask(() => {
+      void refreshAnalytics();
+    });
   }, [refreshAnalytics]);
 
   const refreshMemory = useCallback(async () => {
@@ -367,7 +390,19 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
       addToast(
         "warning",
         "No dataset",
-        "Choose a CSV file first, then start (upload runs automatically)."
+        "Choose a CSV, WAV, or MP3 file first, then start (upload runs automatically)."
+      );
+      return;
+    }
+
+    if (
+      pendingDatasetFile &&
+      !/\.(csv|wav|mp3)$/i.test(pendingDatasetFile.name)
+    ) {
+      addToast(
+        "warning",
+        "Unsupported file",
+        "Use a .csv, .wav, or .mp3 file."
       );
       return;
     }
@@ -401,15 +436,16 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
       }
 
       if (!path) {
-        addToast("error", "Start Failed", "No CSV path after upload.");
+        addToast("error", "Start Failed", "No file path after upload.");
         return;
       }
 
+      const isAudio = /\.(wav|mp3)$/i.test(path);
       setStartPhase("starting");
-      const res = await axios.post(`${API_BASE}/start`, {
-        input_data: "sample_data",
-        input_csv_path: path,
-      });
+      const startBody = isAudio
+        ? { input_data: "audio_trigger", audio_path: path }
+        : { input_data: "sample_data", input_csv_path: path };
+      const res = await axios.post(`${API_BASE}/start`, startBody);
       const data = res.data as Record<string, unknown>;
 
       if (data.success === false) {
@@ -421,7 +457,11 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
 
       const pausedFlag = (data.paused as boolean | undefined) !== false;
       const ui = apiResponseToPipelineUI(data, pausedFlag);
-      setPipeline((prev) => ({ ...prev, ...ui }));
+      setPipeline((prev) => ({
+        ...prev,
+        ...ui,
+        pipeline_kind: isAudio ? "audio" : "tabular",
+      }));
       if (typeof ui.generated_code === "string" && ui.generated_code.trim()) {
         setEditedCode(ui.generated_code);
       }
