@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
+import axios from "axios";
 import {
   Loader2,
   Database,
@@ -9,8 +10,11 @@ import {
   FileSpreadsheet,
   Copy,
   Check,
+  Trash2,
+  Trash,
 } from "lucide-react";
 import { usePipeline, type MemoryItem } from "@/components/PipelineProvider";
+import { API_BASE } from "@/lib/api";
 
 function formatTimeAgo(raw: string | number | null | undefined): string {
   if (raw == null || raw === "") return "";
@@ -49,6 +53,8 @@ export default function MemoryPage() {
   const { memoryItems, memoryLoading, refreshMemory, addToast } = usePipeline();
   const [query, setQuery] = useState("");
   const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
+  const [clearing, setClearing] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   useEffect(() => {
     void refreshMemory();
@@ -62,6 +68,72 @@ export default function MemoryPage() {
       return hay.includes(q);
     });
   }, [memoryItems, query]);
+
+  const clearMemory = async () => {
+    if (
+      !confirm(
+        "Are you sure you want to clear all approved RAG memories? This action cannot be undone."
+      )
+    ) {
+      return;
+    }
+    setClearing(true);
+    try {
+      const res = await axios.delete(`${API_BASE}/memory`);
+      const data = res.data as Record<string, unknown>;
+      if (data.success === false) {
+        addToast(
+          "error",
+          "Clear failed",
+          typeof data.message === "string" ? data.message : "Could not clear memory."
+        );
+        return;
+      }
+      addToast(
+        "success",
+        "Memory cleared",
+        typeof data.message === "string" ? data.message : "Chroma collection emptied."
+      );
+      await refreshMemory();
+    } catch {
+      addToast("error", "Clear failed", "Network error or backend unavailable.");
+    } finally {
+      setClearing(false);
+    }
+  };
+
+  const deleteMemoryItem = async (item: MemoryItem) => {
+    if (!item.id) {
+      addToast("error", "Delete", "This entry has no Chroma id. Refresh the list.");
+      return;
+    }
+    if (!confirm("Delete this memory item?")) return;
+    setDeletingId(item.id);
+    try {
+      const res = await axios.delete(
+        `${API_BASE}/memory/${encodeURIComponent(item.id)}`
+      );
+      const data = res.data as Record<string, unknown>;
+      if (data.success === false) {
+        addToast(
+          "error",
+          "Delete failed",
+          typeof data.message === "string" ? data.message : "Could not delete item."
+        );
+        return;
+      }
+      addToast(
+        "success",
+        "Deleted",
+        typeof data.message === "string" ? data.message : "Memory item removed."
+      );
+      await refreshMemory();
+    } catch {
+      addToast("error", "Delete failed", "Network error or backend unavailable.");
+    } finally {
+      setDeletingId(null);
+    }
+  };
 
   const copyCode = async (code: string, idx: number) => {
     try {
@@ -85,16 +157,34 @@ export default function MemoryPage() {
           <p className="text-[11px] text-gray-500 mt-1">
             Chroma collection{" "}
             <code className="text-gray-400">approved_transforms</code> —{" "}
-            <code className="text-gray-400">GET /memory</code>
+            <code className="text-gray-400">GET /memory</code> ·{" "}
+            <code className="text-gray-400">DELETE /memory</code> ·{" "}
+            <code className="text-gray-400">DELETE /memory/{"{id}"}</code>
           </p>
         </div>
-        <button
-          type="button"
-          onClick={() => void refreshMemory()}
-          className="text-xs font-medium px-3 py-2 rounded-xl border border-[#1c2333] text-gray-300 hover:bg-[#1c2333]/50 shrink-0"
-        >
-          Refresh
-        </button>
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={() => void refreshMemory()}
+            disabled={clearing}
+            className="text-xs font-medium px-3 py-2 rounded-xl border border-[#1c2333] text-gray-300 hover:bg-[#1c2333]/50 disabled:opacity-50"
+          >
+            Refresh
+          </button>
+          <button
+            type="button"
+            onClick={() => void clearMemory()}
+            disabled={clearing || memoryLoading}
+            className="text-xs font-medium px-3 py-2 rounded-xl border border-red-500/50 bg-red-500/10 text-red-400 hover:bg-red-500/20 flex items-center gap-1.5 disabled:opacity-50 disabled:pointer-events-none"
+          >
+            {clearing ? (
+              <Loader2 size={14} className="animate-spin shrink-0" />
+            ) : (
+              <Trash2 size={14} className="shrink-0" />
+            )}
+            Clear Memory
+          </button>
+        </div>
       </div>
 
       <div className="relative mb-6">
@@ -131,7 +221,7 @@ export default function MemoryPage() {
 
             return (
               <li
-                key={`${idx}-${(item.metadata?.timestamp as string) ?? idx}`}
+                key={item.id || `${idx}-${String(item.metadata?.timestamp ?? idx)}`}
                 className="glass-card p-0 overflow-hidden border border-[#1c2333]/80 shadow-lg shadow-black/20"
               >
                 <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 border-b border-[#1c2333] bg-[#080a10]/80">
@@ -171,6 +261,21 @@ export default function MemoryPage() {
                         <Check size={14} className="text-emerald-400" />
                       ) : (
                         <Copy size={14} />
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      title="Delete this memory"
+                      disabled={
+                        clearing || !item.id || deletingId === item.id
+                      }
+                      onClick={() => void deleteMemoryItem(item)}
+                      className="rounded-lg border border-transparent bg-[#0d1117]/95 p-2 text-gray-500 hover:text-red-400 hover:bg-red-500/10 hover:border-red-500/30 transition-colors disabled:opacity-40 disabled:pointer-events-none"
+                    >
+                      {deletingId === item.id ? (
+                        <Loader2 size={14} className="animate-spin text-red-400/80" />
+                      ) : (
+                        <Trash size={14} />
                       )}
                     </button>
                   </div>

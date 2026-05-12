@@ -1,5 +1,5 @@
 """
-LAM-ADEP FastAPI Server v3 — /upload /reject /memory + Dynamic CSV Paths
+LAM-ADEP FastAPI Server v3 — /upload /reject /memory (GET, DELETE, DELETE by id) + Dynamic CSV Paths
 """
 from __future__ import annotations
 
@@ -656,12 +656,14 @@ async def get_memory():
         if not isinstance(results, dict):
             return _safe_json({"success": True, "count": 0, "items": [], "memory": []})
 
-        docs  = _chroma_seq(results.get("documents"))
-        metas = _chroma_seq(results.get("metadatas"))
-        n     = min(len(docs), len(metas))
+        ids_list = _chroma_seq(results.get("ids"))
+        docs     = _chroma_seq(results.get("documents"))
+        metas    = _chroma_seq(results.get("metadatas"))
+        n        = min(len(ids_list), len(docs), len(metas))
 
         for i in range(n):
             try:
+                cid = ids_list[i]
                 doc_raw, meta_raw = docs[i], metas[i]
                 if doc_raw is None and meta_raw is None:
                     continue
@@ -682,7 +684,11 @@ async def get_memory():
                         else ("" if doc_raw is None else str(doc_raw))
                     )
                 )
-                memory.append({"code": code, "metadata": meta})
+                memory.append({
+                    "id":       str(cid) if cid is not None else "",
+                    "code":     code,
+                    "metadata": meta,
+                })
             except Exception:
                 continue
     except ModuleNotFoundError:
@@ -696,6 +702,108 @@ async def get_memory():
         "items":   memory,
         "memory":  memory,
     })
+
+
+@app.delete("/memory", tags=["RLHF"])
+async def clear_memory():
+    """Delete all vectors from the ChromaDB ``approved_transforms`` collection (demo reset)."""
+    try:
+        import chromadb  # type: ignore
+
+        chroma_dir = os.path.join(_BACKEND_DIR, "chroma_db")
+        os.makedirs(chroma_dir, exist_ok=True)
+        client = chromadb.PersistentClient(path=chroma_dir)
+        collection = client.get_or_create_collection("approved_transforms")
+        all_items = collection.get()
+        if not isinstance(all_items, dict):
+            return _safe_json({
+                "success": True,
+                "deleted": 0,
+                "message": "No Chroma records to clear (unexpected get() shape).",
+            })
+        ids = all_items.get("ids")
+        if isinstance(ids, list) and ids:
+            collection.delete(ids=ids)
+            deleted = len(ids)
+        else:
+            deleted = 0
+        logger.info("[Memory] DELETE cleared %d approved_transforms entries.", deleted)
+        return _safe_json({
+            "success": True,
+            "deleted": deleted,
+            "message": (
+                f"Cleared {deleted} approved RAG memor{'y' if deleted == 1 else 'ies'}."
+                if deleted
+                else "Vector memory was already empty."
+            ),
+        })
+    except ModuleNotFoundError:
+        logger.warning("[Memory] DELETE skipped — chromadb not installed.")
+        return _safe_json({
+            "success": False,
+            "deleted": 0,
+            "error": "chromadb_not_installed",
+            "message": "ChromaDB is not installed; nothing was deleted.",
+        })
+    except Exception as exc:
+        logger.error("[Memory] DELETE failed: %s", exc, exc_info=True)
+        return _safe_json({
+            "success": False,
+            "deleted": 0,
+            "error": str(exc),
+            "message": "Failed to clear vector memory.",
+        })
+
+
+@app.delete("/memory/{item_id}", tags=["RLHF"])
+async def delete_memory_item(item_id: str):
+    """Delete a single vector from ``approved_transforms`` by Chroma document id."""
+    safe = (item_id or "").strip()
+    if not safe:
+        return _safe_json({"success": False, "message": "Invalid item id.", "error": "INVALID_ID"})
+
+    try:
+        import chromadb  # type: ignore
+
+        chroma_dir = os.path.join(_BACKEND_DIR, "chroma_db")
+        os.makedirs(chroma_dir, exist_ok=True)
+        client = chromadb.PersistentClient(path=chroma_dir)
+        collection = client.get_or_create_collection("approved_transforms")
+        peek = collection.get(ids=[safe])
+        if not isinstance(peek, dict):
+            return _safe_json({
+                "success": False,
+                "message": "Memory item not found.",
+                "error": "NOT_FOUND",
+            })
+        found = peek.get("ids")
+        if not isinstance(found, list) or not found:
+            return _safe_json({
+                "success": False,
+                "message": "Memory item not found.",
+                "error": "NOT_FOUND",
+            })
+        collection.delete(ids=[safe])
+        logger.info("[Memory] DELETE single id=%s", safe)
+        return _safe_json({
+            "success": True,
+            "message": "Memory item deleted.",
+            "id":      safe,
+        })
+    except ModuleNotFoundError:
+        logger.warning("[Memory] DELETE item skipped — chromadb not installed.")
+        return _safe_json({
+            "success": False,
+            "error": "chromadb_not_installed",
+            "message": "ChromaDB is not installed; nothing was deleted.",
+        })
+    except Exception as exc:
+        logger.error("[Memory] DELETE item failed: %s", exc, exc_info=True)
+        return _safe_json({
+            "success": False,
+            "error": str(exc),
+            "message": "Failed to delete memory item.",
+        })
 
 
 @app.post("/start", response_model=APIResponse, tags=["Pipeline"])

@@ -37,6 +37,8 @@ function apiErrorDetail(data: unknown): string {
 }
 
 export interface MemoryItem {
+  /** ChromaDB document id (for granular DELETE /memory/{id}). */
+  id: string;
   code: string;
   metadata: Record<string, string | number | boolean | null> | null;
 }
@@ -424,6 +426,7 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
       const items: MemoryItem[] = raw.map((x) => {
         const o = x as Record<string, unknown>;
         return {
+          id: typeof o.id === "string" ? o.id : "",
           code: typeof o.code === "string" ? o.code : "",
           metadata:
             o.metadata && typeof o.metadata === "object"
