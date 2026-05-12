@@ -126,11 +126,34 @@ export function uiStatusFromBackend(
   return null;
 }
 
+/** Prefer top-level, then nested `state.generated_code` (some backends omit top-level during poll). */
+function pollGeneratedCodeFromRaw(
+  raw: Record<string, unknown>
+): string | undefined {
+  const top = raw.generated_code;
+  const nestedRaw =
+    raw.state && typeof raw.state === "object"
+      ? (raw.state as Record<string, unknown>).generated_code
+      : undefined;
+
+  const preferNonEmpty = (a: unknown, b: unknown): string | undefined => {
+    if (typeof a === "string" && a.trim() !== "") return a;
+    if (typeof b === "string" && b.trim() !== "") return b;
+    if (typeof a === "string") return a;
+    if (typeof b === "string") return b;
+    return undefined;
+  };
+
+  return preferNonEmpty(top, nestedRaw);
+}
+
 export function mergePollIntoPipelineState(
   raw: Record<string, unknown>,
   prev: PipelineUIState
 ): PipelineUIState {
   const status = uiStatusFromBackend(raw.status) ?? prev.status;
+  const pausedAfterPoll = status === "paused";
+
   const healingRaw = raw.healing_iterations;
   const healing_iterations =
     typeof healingRaw === "number"
@@ -160,6 +183,20 @@ export function mergePollIntoPipelineState(
       ? raw.audio_classifier_prediction
       : prev.audio_classifier_prediction;
 
+  const polledCode = pollGeneratedCodeFromRaw(raw);
+  let nextGenerated: string;
+  if (polledCode === undefined) {
+    nextGenerated = prev.generated_code;
+  } else if (
+    pausedAfterPoll &&
+    polledCode.trim() === "" &&
+    prev.generated_code.trim() !== ""
+  ) {
+    nextGenerated = prev.generated_code;
+  } else {
+    nextGenerated = polledCode;
+  }
+
   return {
     ...prev,
     status,
@@ -171,10 +208,7 @@ export function mergePollIntoPipelineState(
       typeof raw.thread_id === "string" ? raw.thread_id : prev.thread_id,
     message: typeof raw.message === "string" ? raw.message : prev.message,
     stages_completed: nextStages,
-    generated_code:
-      typeof raw.generated_code === "string"
-        ? raw.generated_code
-        : prev.generated_code,
+    generated_code: nextGenerated,
     healing_iterations,
     pipeline_kind: nextKind,
     audio_transcript,

@@ -417,6 +417,36 @@ def _multimodal_status_fields(state: dict[str, Any]) -> dict[str, str]:
         "audio_classifier_prediction": pred,
     }
 
+
+def _mirror_generated_code_from_checkpoint_into_latest() -> None:
+    """Refresh top-level ``generated_code`` on ``_latest_status`` from LangGraph during HITL.
+
+    ``GET /status`` serves only ``_latest_status``; stale or restarted processes can serve an
+    empty string while the checkpoint still holds code. Prefer a non-empty value from the
+    graph; if the checkpoint string is empty, keep any non-empty cached ``_latest_status``."""
+    global _latest_status
+    if _latest_status.get("status") != "paused_for_approval":
+        return
+    tid = _latest_status.get("thread_id")
+    if not tid or not str(tid).strip():
+        return
+    try:
+        config = _cfg(str(tid).strip())
+        snapshot = _compiled_graph.get_state(config)
+        if not snapshot or not getattr(snapshot, "next", None):
+            return
+        values = _to_dict(snapshot)
+        raw = values.get("generated_code", "")
+        incoming = raw if isinstance(raw, str) else ""
+        prev = _latest_status.get("generated_code", "")
+        prev_s = prev if isinstance(prev, str) else ""
+        _latest_status["generated_code"] = (
+            incoming if incoming.strip() else prev_s
+        )
+    except Exception as exc:
+        logger.debug("[Status] checkpoint code mirror skipped: %s", exc)
+
+
 # Uploaded CSVs land here; paths are validated before use by LangGraph / sandbox.
 _TEMP_DATA_DIR = os.path.join(_BACKEND_DIR, "temp_data")
 
@@ -477,6 +507,7 @@ async def health():
 
 @app.get("/status", tags=["Pipeline"])
 async def get_status():
+    _mirror_generated_code_from_checkpoint_into_latest()
     return _latest_status
 
 
@@ -718,6 +749,7 @@ async def start_pipeline(body: StartRequest):
         "healing_iterations": 0,
         **_multimodal_status_fields(current_state),
     }
+    _mirror_generated_code_from_checkpoint_into_latest()
 
     return APIResponse(
         success=True, thread_id=thread_id, state=current_state,
@@ -815,6 +847,7 @@ async def approve_pipeline(body: ApproveRequest):
             "healing_iterations": hit_iter,
             **_multimodal_status_fields(final_state),
         }
+        _mirror_generated_code_from_checkpoint_into_latest()
         return APIResponse(
             success=True,
             thread_id=body.thread_id,
@@ -917,6 +950,8 @@ async def reject_pipeline(body: RejectRequest):
         "active_csv":        os.path.basename(csv_path),
         **_multimodal_status_fields(current_state),
     }
+
+    _mirror_generated_code_from_checkpoint_into_latest()
 
     return APIResponse(
         success=True, thread_id=body.thread_id, state=current_state,

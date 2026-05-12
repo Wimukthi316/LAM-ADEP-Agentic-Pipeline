@@ -44,7 +44,7 @@ export interface MemoryItem {
 interface PipelineContextValue {
   pipeline: PipelineUIState;
   editedCode: string;
-  setEditedCode: (v: string) => void;
+  setEditedCode: React.Dispatch<React.SetStateAction<string>>;
   /** Basename for analytics/download UI (from uploaded path or pending file). */
   csvFilename: string | null;
   pendingDatasetFile: File | null;
@@ -94,8 +94,16 @@ function apiResponseToPipelineUI(
     data.state && typeof data.state === "object"
       ? (data.state as Record<string, unknown>)
       : {};
-  const generated =
+  const fromState =
     typeof st.generated_code === "string" ? st.generated_code : "";
+  const fromTop =
+    typeof data.generated_code === "string"
+      ? (data.generated_code as string)
+      : "";
+  const generated =
+    fromState.trim() !== ""
+      ? fromState
+      : fromTop;
   const hit = st.healing_iterations;
   const healing_iterations =
     typeof hit === "number"
@@ -233,8 +241,9 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
   }, [pipeline.thread_id]);
 
   useEffect(() => {
-    if (!isPaused || !pipeline.generated_code) return;
+    if (!isPaused) return;
     const code = pipeline.generated_code;
+    if (typeof code !== "string" || !code.trim()) return;
     queueMicrotask(() => {
       setEditedCode(code);
     });
@@ -694,7 +703,7 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
   }, [addToast, csvFilename]);
 
   const value = useMemo(
-    () => ({
+    (): PipelineContextValue => ({
       pipeline,
       editedCode,
       setEditedCode,

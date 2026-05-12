@@ -2,6 +2,7 @@
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
+import axios from "axios";
 import {
   CheckCircle2,
   XCircle,
@@ -10,6 +11,7 @@ import {
   Mic,
 } from "lucide-react";
 import { usePipeline } from "@/components/PipelineProvider";
+import { API_BASE } from "@/lib/api";
 
 /** Minimal Web Speech API surface (DOM lib types vary by TS `lib` config). */
 type WebSpeechRecognition = {
@@ -66,9 +68,100 @@ export default function HitlPage() {
   const showMonacoEditor =
     isPaused ||
     ((isCompleted || isRegenerating) && Boolean(codeForEditor.trim()));
+  /** While paused, treat whitespace-only local state as empty so backend code is visible immediately. */
   const monacoValue = isPaused
-    ? editedCode || pipeline.generated_code || ""
+    ? editedCode.trim() !== ""
+      ? editedCode
+      : pipeline.generated_code || ""
     : codeForEditor;
+
+  useEffect(() => {
+    if (!isPaused) return;
+    const gen = pipeline.generated_code ?? "";
+    if (!gen.trim()) return;
+    setEditedCode((prev) => (prev.trim() === "" ? gen : prev));
+  }, [isPaused, pipeline.generated_code, setEditedCode]);
+
+  useEffect(() => {
+    if (!isPaused || !pipeline.thread_id) return;
+    const tid = pipeline.thread_id;
+    if ((pipeline.generated_code ?? "").trim() !== "") return;
+
+    const ac = new AbortController();
+
+    async function hydratePausedCodeOnce() {
+      try {
+        const stRes = await axios.get(`${API_BASE}/status`, {
+          signal: ac.signal,
+        });
+        if (
+          ac.signal.aborted ||
+          !stRes.data ||
+          typeof stRes.data !== "object"
+        ) {
+          return;
+        }
+        const raw = stRes.data as Record<string, unknown>;
+        let pulled = "";
+        if (typeof raw.generated_code === "string" && raw.generated_code.trim()) {
+          pulled = raw.generated_code;
+        } else {
+          const nestedState =
+            raw.state && typeof raw.state === "object"
+              ? (raw.state as Record<string, unknown>)
+              : null;
+          const nested = nestedState?.generated_code;
+          if (typeof nested === "string" && nested.trim()) {
+            pulled = nested;
+          }
+        }
+        if (!ac.signal.aborted && pulled.trim()) {
+          setEditedCode((prev) => (prev.trim() === "" ? pulled : prev));
+          return;
+        }
+
+        const tRes = await axios.get(
+          `${API_BASE}/state/${encodeURIComponent(tid)}`,
+          { signal: ac.signal }
+        );
+        if (
+          ac.signal.aborted ||
+          !tRes.data ||
+          typeof tRes.data !== "object"
+        )
+          return;
+        const tData = tRes.data as Record<string, unknown>;
+        if (
+          tData.success === false ||
+          tData.paused !== true
+        )
+          return;
+        const rawState =
+          tData.state && typeof tData.state === "object"
+            ? (tData.state as Record<string, unknown>)
+            : {};
+        const fromCheckpoint =
+          typeof rawState.generated_code === "string"
+            ? rawState.generated_code
+            : "";
+        if (!ac.signal.aborted && fromCheckpoint.trim()) {
+          setEditedCode((prev) =>
+            prev.trim() === "" ? fromCheckpoint : prev
+          );
+        }
+      } catch {
+        /* ignore abort / transient errors during one-shot hydrate */
+      }
+    }
+
+    void hydratePausedCodeOnce();
+    return () => ac.abort();
+  }, [
+    isPaused,
+    pipeline.thread_id,
+    pipeline.generated_code,
+    setEditedCode,
+  ]);
 
   const stopRecognitionHardware = useCallback(() => {
     try {
@@ -250,6 +343,7 @@ export default function HitlPage() {
               </span>
             </div>
             <MonacoEditor
+              key={`hitl-monaco-${pipeline.thread_id ?? "none"}-${pipeline.generated_code?.trim() ? "has-code" : "no-code"}`}
               height="420px"
               language="python"
               theme="vs-dark"
