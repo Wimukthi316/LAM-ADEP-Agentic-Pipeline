@@ -254,15 +254,54 @@ export function PipelineProvider({ children }: { children: React.ReactNode }) {
     const interval = setInterval(async () => {
       try {
         const res = await axios.get(`${API_BASE}/status`);
-        if (res.data && typeof res.data === "object") {
-          setPipeline((prev) => {
-            if (rejectingInFlightRef.current) return prev;
-            return mergePollIntoPipelineState(
-              res.data as Record<string, unknown>,
-              prev
-            );
-          });
+        if (!res.data || typeof res.data !== "object") return;
+
+        let raw = res.data as Record<string, unknown>;
+
+        if (raw.status === "paused_for_approval") {
+          const topCode =
+            typeof raw.generated_code === "string" ? raw.generated_code : "";
+          const nested =
+            raw.state && typeof raw.state === "object"
+              ? (raw.state as Record<string, unknown>).generated_code
+              : undefined;
+          const nestedCode =
+            typeof nested === "string" ? nested : "";
+          const hasCode =
+            topCode.trim() !== "" || nestedCode.trim() !== "";
+          const tid =
+            typeof raw.thread_id === "string" && raw.thread_id.trim()
+              ? raw.thread_id.trim()
+              : window.localStorage.getItem("lam_adep_thread_id");
+          if (!hasCode && tid) {
+            try {
+              const tRes = await axios.get(`${API_BASE}/state/${tid}`);
+              const tData = tRes.data as Record<string, unknown>;
+              if (
+                tData.success !== false &&
+                tData.state &&
+                typeof tData.state === "object"
+              ) {
+                const st = tData.state as Record<string, unknown>;
+                const gc =
+                  typeof st.generated_code === "string"
+                    ? st.generated_code
+                    : "";
+                if (gc.trim()) {
+                  raw = { ...raw, generated_code: gc };
+                  setEditedCode(gc);
+                }
+              }
+            } catch {
+              /* ignore direct state fetch */
+            }
+          }
         }
+
+        setPipeline((prev) => {
+          if (rejectingInFlightRef.current) return prev;
+          return mergePollIntoPipelineState(raw, prev);
+        });
       } catch {
         /* ignore poll errors */
       }

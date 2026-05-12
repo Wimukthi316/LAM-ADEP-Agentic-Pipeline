@@ -419,30 +419,29 @@ def _multimodal_status_fields(state: dict[str, Any]) -> dict[str, str]:
 
 
 def _mirror_generated_code_from_checkpoint_into_latest() -> None:
-    """Refresh top-level ``generated_code`` on ``_latest_status`` from LangGraph during HITL.
+    """Copy ``generated_code`` from the LangGraph checkpointer into ``_latest_status`` when HITL is active.
 
-    ``GET /status`` serves only ``_latest_status``; stale or restarted processes can serve an
-    empty string while the checkpoint still holds code. Prefer a non-empty value from the
-    graph; if the checkpoint string is empty, keep any non-empty cached ``_latest_status``."""
+    Do not gate on ``snapshot.next``: when paused at an interrupt, ``next`` may be empty or
+    differ by LangGraph version, which left ``GET /status`` stuck with an empty string."""
     global _latest_status
     if _latest_status.get("status") != "paused_for_approval":
         return
     tid = _latest_status.get("thread_id")
-    if not tid or not str(tid).strip():
+    if not tid or not str(tid).strip() or _compiled_graph is None:
         return
     try:
-        config = _cfg(str(tid).strip())
-        snapshot = _compiled_graph.get_state(config)
-        if not snapshot or not getattr(snapshot, "next", None):
+        state_obj = _compiled_graph.get_state(_cfg(str(tid).strip()))
+        if not state_obj:
             return
-        values = _to_dict(snapshot)
-        raw = values.get("generated_code", "")
-        incoming = raw if isinstance(raw, str) else ""
+        values = getattr(state_obj, "values", None)
+        if isinstance(values, dict):
+            raw = values.get("generated_code", "")
+        else:
+            raw = _to_dict(state_obj).get("generated_code", "")
+        incoming = raw if isinstance(raw, str) else ("" if raw is None else str(raw))
         prev = _latest_status.get("generated_code", "")
         prev_s = prev if isinstance(prev, str) else ""
-        _latest_status["generated_code"] = (
-            incoming if incoming.strip() else prev_s
-        )
+        _latest_status["generated_code"] = incoming if incoming.strip() else prev_s
     except Exception as exc:
         logger.debug("[Status] checkpoint code mirror skipped: %s", exc)
 
@@ -507,7 +506,38 @@ async def health():
 
 @app.get("/status", tags=["Pipeline"])
 async def get_status():
-    _mirror_generated_code_from_checkpoint_into_latest()
+    # Fail-safe: always re-read from checkpointer when paused (static _latest_status can be stale).
+    if (
+        _latest_status.get("status") == "paused_for_approval"
+        and _compiled_graph is not None
+    ):
+        thread_id = _latest_status.get("thread_id")
+        if thread_id and str(thread_id).strip():
+            try:
+                cfg = _cfg(str(thread_id).strip())
+                state_obj = _compiled_graph.get_state(cfg)
+                if state_obj:
+                    vals = getattr(state_obj, "values", None)
+                    if isinstance(vals, dict):
+                        gc_raw = vals.get("generated_code", "")
+                    else:
+                        gc_raw = _to_dict(state_obj).get("generated_code", "")
+                    from_ckpt = (
+                        gc_raw
+                        if isinstance(gc_raw, str)
+                        else ("" if gc_raw is None else str(gc_raw))
+                    )
+                    prev_gc = _latest_status.get("generated_code", "")
+                    prev_s = prev_gc if isinstance(prev_gc, str) else ""
+                    _latest_status["generated_code"] = (
+                        from_ckpt if from_ckpt.strip() else prev_s
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[Status] checkpoint hydrate for paused thread failed: %s",
+                    exc,
+                    exc_info=True,
+                )
     return _latest_status
 
 

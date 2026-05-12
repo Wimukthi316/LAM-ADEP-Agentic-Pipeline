@@ -17,7 +17,9 @@ Graph Topology (v3 — multimodal entry + healing back-edge)
     └──────────────────────────────→ discovery ────────────┤
                                                               ↓
                     transform ←──────────────────────────────┘
-                          ↓  (HITL interrupt)
+                          ↓
+                    hitl_gate  (HITL interrupt — checkpoint has generated_code)
+                          ↓
                       healing ──(reject, iter<3)──→ transform
                           ↓  (approve OR max iters)
                     orchestrator → END
@@ -1056,10 +1058,34 @@ def transform_node(state: PipelineState) -> PipelineState:
             "Output only `def transform_data(df):` as specified; you may `print` a one-line row-count summary inside it.\n"
         )
 
+    def _sanitize_for_comment(msg: object, max_len: int = 480) -> str:
+        t = str(msg).replace("\r", " ").replace("\n", " ")
+        return t[:max_len]
+
     generated_code = TRANSFORM_CODE_FALLBACK
     try:
         model = _get_gemini()
-        response = model.generate_content(prompt)
+        response = None
+        last_gen_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = model.generate_content(prompt)
+                break
+            except Exception as gen_exc:
+                last_gen_exc = gen_exc
+                logger.warning(
+                    "[Transform] generate_content attempt %d/3 failed: %s",
+                    attempt + 1,
+                    gen_exc,
+                )
+                if attempt < 2:
+                    time.sleep(2)
+                else:
+                    raise last_gen_exc from None
+
+        if response is None:
+            raise RuntimeError("Gemini produced no response after retries.")
+
         raw = (response.text or "").strip()
         normalized = _extract_transform_data_function(raw)
         valid_fn = bool(
@@ -1076,29 +1102,51 @@ def transform_node(state: PipelineState) -> PipelineState:
                 )
             else:
                 logger.warning("[Transform] Gemini returned empty — using fallback.")
+            generated_code = (
+                "# ⚠️ Gemini returned invalid code. Using fallback.\n\n"
+                + TRANSFORM_CODE_FALLBACK
+            )
 
     except Exception as exc:
         logger.error("[Transform] Gemini error: %s", exc, exc_info=True)
-        generated_code = TRANSFORM_CODE_FALLBACK
+        detail = _sanitize_for_comment(exc)
+        generated_code = (
+            f"# ⚠️ [NEURO-SYMBOLIC PIPELINE] Gemini API Error: {detail}\n"
+            "# ⚠️ Switching to Rule-Based Fallback Engine.\n\n"
+            + TRANSFORM_CODE_FALLBACK
+        )
 
-    updated_state = {
+    return {
         **state,
         "status":         "Code Generated — Pending Approval",
         "generated_code": generated_code,
         "edited_code":    generated_code,  # pre-fill Monaco Editor
     }
 
-    # ── HITL Gate ──────────────────────────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# Node 2b — HITL gate (interrupt only after transform commits to checkpoint)
+# ---------------------------------------------------------------------------
+
+def hitl_gate_node(state: PipelineState) -> PipelineState:
+    """Pause for human review.
+
+    Must run *after* ``transform_node`` returns so LangGraph persists ``generated_code`` in the
+    checkpoint. Calling ``interrupt()`` inside ``transform_node`` before ``return`` left the
+    paused checkpoint without code (Monaco empty until Approve completed the node).
+    """
+    healing_iterations = state.get("healing_iterations", 0)
+    generated_code = (state.get("generated_code") or "").strip()
+
     human_decision: str = interrupt({
-        "message":          "Review the generated transformation code.",
-        "generated_code":   generated_code,
+        "message":           "Review the generated transformation code.",
+        "generated_code":    generated_code,
         "healing_iteration": healing_iterations,
-        "action_required":  "Resume with 'Approve' or 'Reject: <feedback>'. Code must define transform_data(df) only.",
+        "action_required":   "Resume with 'Approve' or 'Reject: <feedback>'. Code must define transform_data(df) only.",
     })
 
-    updated_state["human_feedback"] = human_decision
-    logger.info("[Transform] HITL decision: %s", human_decision[:80])
-    return updated_state
+    logger.info("[HITL] decision: %s", human_decision[:80])
+    return {**state, "human_feedback": human_decision}
 
 
 # ---------------------------------------------------------------------------
@@ -1304,8 +1352,8 @@ def build_graph() -> StateGraph:
     """Compile the LAM-ADEP v3 pipeline graph.
 
     Topology:
-      START → audio_preprocessing | discovery → transform (HITL interrupt)
-                                                    ↓
+      START → audio_preprocessing | discovery → transform → hitl_gate (interrupt)
+                                                              ↓
                         healing ──(reject, iter ≤ MAX)──→ transform
                                 ↓    (approve OR iter > MAX)
                           orchestrator → END
@@ -1315,6 +1363,7 @@ def build_graph() -> StateGraph:
     builder.add_node("audio_preprocessing", audio_preprocessing_node)
     builder.add_node("discovery",    discovery_node)
     builder.add_node("transform",    transform_node)
+    builder.add_node("hitl_gate",    hitl_gate_node)
     builder.add_node("healing",      healing_node)
     builder.add_node("orchestrator", orchestrator_node)
 
@@ -1328,7 +1377,8 @@ def build_graph() -> StateGraph:
     )
     builder.add_edge("audio_preprocessing", "transform")
     builder.add_edge("discovery",    "transform")
-    builder.add_edge("transform",    "healing")
+    builder.add_edge("transform",    "hitl_gate")
+    builder.add_edge("hitl_gate",    "healing")
 
     builder.add_conditional_edges(
         "healing",
